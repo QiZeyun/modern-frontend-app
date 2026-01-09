@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import * as XLSX from 'xlsx'
 
-type MatchType = 'exact' | 'fuzzy' | 'raw'
+type MatchType = 'exact' | 'raw'
 
 type ParsedPair = {
   name: string
@@ -30,6 +30,8 @@ type GeminiGenerateContentResponse = {
     }
   }>
 }
+
+type GeminiModelPreset = 'gemini-1.5-flash' | 'gemini-1.5-pro' | 'gemini-2.0-flash' | 'gemini-2.0-flash-lite' | 'custom'
 
 function isAbortError(e: unknown) {
   return e instanceof DOMException && e.name === 'AbortError'
@@ -101,29 +103,6 @@ function normalizeTranscript(text: string) {
   return out.replace(/\s+/g, ' ').trim()
 }
 
-function levenshtein(a: string, b: string) {
-  const aa = Array.from(a)
-  const bb = Array.from(b)
-  const n = aa.length
-  const m = bb.length
-  const dp: number[][] = Array.from({ length: n + 1 }, () =>
-    Array.from({ length: m + 1 }, () => 0),
-  )
-  for (let i = 0; i <= n; i++) dp[i][0] = i
-  for (let j = 0; j <= m; j++) dp[0][j] = j
-  for (let i = 1; i <= n; i++) {
-    for (let j = 1; j <= m; j++) {
-      const cost = aa[i - 1] === bb[j - 1] ? 0 : 1
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + cost,
-      )
-    }
-  }
-  return dp[n][m]
-}
-
 function bestNameMatch(rawName: string, roster: string[]) {
   const cleaned = rawName.replace(/\s+/g, '').replace(/同学|同學/g, '')
   if (!cleaned) {
@@ -132,18 +111,9 @@ function bestNameMatch(rawName: string, roster: string[]) {
   if (roster.includes(cleaned)) {
     return { name: cleaned, matchType: 'exact' as const, confidence: 1 }
   }
-  let best = { name: cleaned, confidence: 0 }
-  for (const candidate of roster) {
-    const dist = levenshtein(cleaned, candidate)
-    const denom = Math.max(Array.from(cleaned).length, Array.from(candidate).length, 1)
-    const sim = 1 - dist / denom
-    if (sim > best.confidence) best = { name: candidate, confidence: sim }
-  }
-  // Conservative threshold: avoid wrong matches in noisy speech
-  if (best.confidence >= 0.6) {
-    return { name: best.name, matchType: 'fuzzy' as const, confidence: best.confidence }
-  }
-  return { name: cleaned, matchType: 'raw' as const, confidence: best.confidence }
+  // Important: avoid aggressive fuzzy matching that may mis-identify students.
+  // If not an exact match, keep raw and let AI (or user) decide.
+  return { name: cleaned, matchType: 'raw' as const, confidence: 0 }
 }
 
 function chineseToNumber(raw: string) {
@@ -310,6 +280,91 @@ function extractJsonArrayFromText(text: string) {
   return null
 }
 
+async function geminiParseHomeworkScores(params: {
+  apiKey: string
+  model: string
+  transcript: string
+  roster: string[]
+  signal?: AbortSignal
+}): Promise<Array<{ name: string; score: number }>> {
+  const { apiKey, model, transcript, roster, signal } = params
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    model,
+  )}:generateContent?key=${encodeURIComponent(apiKey)}`
+
+  const prompt = [
+    '你是语文老师的“作业成绩语音录入助手”。',
+    '给你两份输入：1) 花名册（学生姓名列表） 2) 老师口述成绩的识别文本。',
+    '任务：从识别文本中提取每个学生的成绩，并把姓名映射为花名册中的姓名。',
+    '',
+    '强约束：',
+    '1) 只输出 JSON 数组，不要任何额外文字',
+    '2) 数组元素是对象：{"name": "<花名册中的姓名>", "score": <0-100整数>}',
+    '3) name 必须严格来自花名册；不确定就忽略该条（不要编造）',
+    '4) 同一学生出现多次取“最后一次”成绩',
+    '5) 过滤噪声词（如：语文/作业/成绩/分数/今天/同学/得了/是/为等）',
+    '',
+    '花名册：',
+    JSON.stringify(roster),
+    '',
+    '识别文本：',
+    transcript,
+  ].join('\n')
+
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.1,
+        topP: 0.9,
+        maxOutputTokens: 1024,
+      },
+    }),
+  })
+
+  if (!res.ok) {
+    let details = ''
+    try {
+      details = JSON.stringify(await res.json())
+    } catch {
+      details = await res.text()
+    }
+    throw new Error(`Gemini API 请求失败：HTTP ${res.status} ${res.statusText}${details ? ` - ${details}` : ''}`)
+  }
+
+  const data = (await res.json()) as GeminiGenerateContentResponse
+  const parts = data.candidates?.[0]?.content?.parts ?? []
+  const text = parts
+    .map((p) => p.text ?? '')
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .join('\n')
+
+  const jsonArr = extractJsonArrayFromText(text)
+  if (!jsonArr) return []
+
+  const parsed = JSON.parse(jsonArr) as unknown
+  if (!Array.isArray(parsed)) return []
+
+  const rosterSet = new Set(roster)
+  const byName = new Map<string, number>()
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') continue
+    const name = String((item as { name?: unknown }).name ?? '').trim()
+    const scoreRaw = (item as { score?: unknown }).score
+    const scoreNum = typeof scoreRaw === 'number' ? scoreRaw : Number(scoreRaw)
+    if (!name || !rosterSet.has(name)) continue
+    if (!Number.isFinite(scoreNum)) continue
+    const s = clampScore(Math.round(scoreNum))
+    if (s === null) continue
+    byName.set(name, s)
+  }
+  return Array.from(byName.entries()).map(([name, score]) => ({ name, score }))
+}
+
 async function geminiExtractRosterNames(params: {
   apiKey: string
   model: string
@@ -403,13 +458,24 @@ function App() {
     return envKey || localStorage.getItem('geminiApiKey') || ''
   })
   const [rememberGeminiKey, setRememberGeminiKey] = useState(() => Boolean(localStorage.getItem('geminiApiKey')))
-  const [geminiModel, setGeminiModel] = useState(() => localStorage.getItem('geminiModel') || 'gemini-1.5-flash')
+  const [geminiModelPreset, setGeminiModelPreset] = useState<GeminiModelPreset>(() => {
+    const saved = localStorage.getItem('geminiModelPreset') as GeminiModelPreset | null
+    return saved || 'gemini-1.5-flash'
+  })
+  const [geminiModelCustom, setGeminiModelCustom] = useState(() => localStorage.getItem('geminiModelCustom') || '')
+  const geminiModel = geminiModelPreset === 'custom' ? geminiModelCustom.trim() : geminiModelPreset
   const [geminiInputText, setGeminiInputText] = useState('')
   const [geminiMode, setGeminiMode] = useState<GeminiRosterMode>('append')
   const [geminiPreview, setGeminiPreview] = useState<string[]>([])
   const [geminiStatus, setGeminiStatus] = useState('')
   const [geminiLoading, setGeminiLoading] = useState(false)
   const geminiAbortRef = useRef<AbortController | null>(null)
+  const [useGeminiForMatching, setUseGeminiForMatching] = useState(() => {
+    const saved = localStorage.getItem('useGeminiForMatching')
+    return saved ? saved === '1' : true
+  })
+  const [geminiMatchLoading, setGeminiMatchLoading] = useState(false)
+  const [geminiMatchStatus, setGeminiMatchStatus] = useState('')
 
   const [isRecording, setIsRecording] = useState(false)
   const [status, setStatus] = useState<string>('')
@@ -431,8 +497,16 @@ function App() {
   }, [rosterText])
 
   useEffect(() => {
-    localStorage.setItem('geminiModel', geminiModel)
-  }, [geminiModel])
+    localStorage.setItem('geminiModelPreset', geminiModelPreset)
+  }, [geminiModelPreset])
+
+  useEffect(() => {
+    localStorage.setItem('geminiModelCustom', geminiModelCustom)
+  }, [geminiModelCustom])
+
+  useEffect(() => {
+    localStorage.setItem('useGeminiForMatching', useGeminiForMatching ? '1' : '0')
+  }, [useGeminiForMatching])
 
   useEffect(() => {
     if (!rememberGeminiKey) {
@@ -511,21 +585,74 @@ function App() {
     }
   }
 
-  const stopAndSave = () => {
+  const stopAndSave = async () => {
     setStatus('')
+    setGeminiMatchStatus('')
     recognitionRef.current?.stop()
     setIsRecording(false)
 
-    // Merge parsed results into editable table by name
+    const transcript = (finalText + ' ' + interimText).trim()
+    if (!transcript) return
+
+    const key = geminiApiKey.trim()
+    const canUseGemini = Boolean(useGeminiForMatching && key && geminiModel && roster.length > 0)
+
+    if (canUseGemini) {
+      geminiAbortRef.current?.abort()
+      const ac = new AbortController()
+      geminiAbortRef.current = ac
+      setGeminiMatchLoading(true)
+      try {
+        const pairs = await geminiParseHomeworkScores({
+          apiKey: key,
+          model: geminiModel,
+          transcript,
+          roster,
+          signal: ac.signal,
+        })
+        setEntries((prev) => {
+          const map = new Map<string, Entry>()
+          for (const e of prev) map.set(e.name.trim(), e)
+          for (const p of pairs) {
+            const existing = map.get(p.name)
+            if (existing) map.set(p.name, { ...existing, score: p.score })
+            else map.set(p.name, { id: uid(), name: p.name, score: p.score })
+          }
+          return Array.from(map.values())
+        })
+        setGeminiMatchStatus(pairs.length ? `Gemini 已匹配并写入 ${pairs.length} 条记录。` : 'Gemini 未匹配到可确认的姓名-成绩（请检查花名册或转写文本）。')
+      } catch (e) {
+        if (isAbortError(e)) setGeminiMatchStatus('已取消 Gemini 匹配请求。')
+        else setGeminiMatchStatus((e as Error).message || 'Gemini 匹配失败。')
+        // Fallback to local parsing (no fuzzy mapping)
+        setEntries((prev) => {
+          const map = new Map<string, Entry>()
+          for (const e0 of prev) map.set(e0.name.trim(), e0)
+          for (const p of parsedLive) {
+            const key0 = p.name.trim()
+            if (!key0) continue
+            const existing = map.get(key0)
+            if (existing) map.set(key0, { ...existing, score: p.score })
+            else map.set(key0, { id: uid(), name: key0, score: p.score })
+          }
+          return Array.from(map.values())
+        })
+      } finally {
+        setGeminiMatchLoading(false)
+      }
+      return
+    }
+
+    // Local fallback: merge parsed results into editable table (no aggressive fuzzy matching)
     setEntries((prev) => {
       const map = new Map<string, Entry>()
       for (const e of prev) map.set(e.name.trim(), e)
       for (const p of parsedLive) {
-        const key = p.name.trim()
-        if (!key) continue
-        const existing = map.get(key)
-        if (existing) map.set(key, { ...existing, score: p.score })
-        else map.set(key, { id: uid(), name: key, score: p.score })
+        const key0 = p.name.trim()
+        if (!key0) continue
+        const existing = map.get(key0)
+        if (existing) map.set(key0, { ...existing, score: p.score })
+        else map.set(key0, { id: uid(), name: key0, score: p.score })
       }
       return Array.from(map.values())
     })
@@ -624,7 +751,7 @@ function App() {
             >
               开始录音
             </button>
-            <button className="btn" onClick={stopAndSave} disabled={!isRecording && parsedLive.length === 0}>
+            <button className="btn" onClick={stopAndSave} disabled={(!isRecording && !liveText) || geminiMatchLoading}>
               结束 / 保存到登记表
             </button>
             <button className="btn btn-danger" onClick={clearAll} disabled={!finalText && !interimText && entries.length === 0}>
@@ -668,6 +795,22 @@ function App() {
           )}
 
           {status ? <div className="hint danger">{status}</div> : null}
+          {geminiMatchStatus ? (
+            <div className={`hint ${geminiMatchStatus.includes('失败') ? 'danger' : ''}`}>{geminiMatchStatus}</div>
+          ) : null}
+
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={useGeminiForMatching}
+              onChange={(e) => setUseGeminiForMatching(e.target.checked)}
+              disabled={!geminiApiKey.trim()}
+            />
+            <span>
+              结束保存时用 Gemini 基于花名册做姓名匹配（更准确，需填写 API Key）
+              {geminiMatchLoading ? '（匹配中…）' : ''}
+            </span>
+          </label>
         </section>
 
         <section className="panel">
@@ -702,14 +845,32 @@ function App() {
             </label>
             <label className="field">
               <div className="field-label">模型</div>
+              <select
+                className="input select"
+                value={geminiModelPreset}
+                onChange={(e) => setGeminiModelPreset(e.target.value as GeminiModelPreset)}
+                aria-label="Gemini 模型选择"
+              >
+                <option value="gemini-1.5-flash">gemini-1.5-flash（推荐）</option>
+                <option value="gemini-1.5-pro">gemini-1.5-pro</option>
+                <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+                <option value="gemini-2.0-flash-lite">gemini-2.0-flash-lite</option>
+                <option value="custom">自定义…</option>
+              </select>
+            </label>
+          </div>
+
+          {geminiModelPreset === 'custom' ? (
+            <label className="field">
+              <div className="field-label">自定义模型名称</div>
               <input
                 className="input"
-                value={geminiModel}
-                onChange={(e) => setGeminiModel(e.target.value)}
+                value={geminiModelCustom}
+                onChange={(e) => setGeminiModelCustom(e.target.value)}
                 placeholder="例如：gemini-1.5-flash"
               />
             </label>
-          </div>
+          ) : null}
 
           <label className="check">
             <input
@@ -788,9 +949,7 @@ function App() {
                       <span className={`tag tag-${p.matchType}`}>
                         {p.matchType === 'exact'
                           ? '花名册匹配'
-                          : p.matchType === 'fuzzy'
-                            ? `模糊匹配 ${(p.confidence * 100).toFixed(0)}%`
-                            : '未匹配'}
+                          : '未匹配'}
                       </span>
                     </div>
                     <div className="preview-score">{p.score}</div>
