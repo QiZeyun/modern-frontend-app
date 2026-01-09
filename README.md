@@ -94,7 +94,31 @@ vercel
 5. Vercel 会自动检测项目配置（已包含 `vercel.json`）
 6. 点击 "Deploy" 完成部署
 
-部署后，每次 push 代码到 `main` 分支，Vercel 会自动重新部署。
+### 配置自动部署
+
+项目已通过 CLI 部署，如需配置自动部署（每次 push 代码自动部署），请按以下步骤操作：
+
+1. **访问项目设置**
+   - 打开 https://vercel.com/zeyuns-projects/modern-frontend-app/settings
+   - 或访问 [Vercel Dashboard](https://vercel.com/dashboard)，找到 `modern-frontend-app` 项目
+
+2. **连接 GitHub 仓库**
+   - 在项目设置页面，点击左侧菜单的 **"Git"**
+   - 如果显示 "Not Connected"，点击 **"Connect Git Repository"**
+   - 选择你的 GitHub 账户（如果未授权，会提示授权）
+   - 选择仓库 `QiZeyun/modern-frontend-app`
+   - 点击 **"Connect"**
+
+3. **配置部署分支**
+   - 在 Git 设置中，确保 **"Production Branch"** 设置为 `main`
+   - 确保 **"Auto Deploy"** 选项已启用
+
+4. **配置预览部署**（可选）
+   - 在 "Preview Deployments" 部分
+   - 启用 **"Automatic Preview Deployments"**
+   - 这样每次创建 Pull Request 时也会自动生成预览部署
+
+配置完成后，每次 push 代码到 `main` 分支，Vercel 会自动触发部署。
 
 ## GitHub Actions
 
