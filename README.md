@@ -65,6 +65,37 @@ pnpm lint
 pnpm type-check
 ```
 
+## 部署
+
+### Vercel 部署
+
+项目已配置 Vercel 部署，可以通过以下方式部署：
+
+#### 方式一：通过 Vercel CLI（推荐）
+
+1. 安装 Vercel CLI：
+```bash
+npm install -g vercel
+```
+
+2. 在项目根目录运行：
+```bash
+vercel
+```
+
+3. 按照提示完成部署配置
+
+#### 方式二：通过 Vercel 网站
+
+1. 访问 [Vercel](https://vercel.com)
+2. 使用 GitHub 账号登录
+3. 点击 "Add New Project"
+4. 导入你的 GitHub 仓库 `QiZeyun/modern-frontend-app`
+5. Vercel 会自动检测项目配置（已包含 `vercel.json`）
+6. 点击 "Deploy" 完成部署
+
+部署后，每次 push 代码到 `main` 分支，Vercel 会自动重新部署。
+
 ## GitHub Actions
 
 项目配置了 GitHub Actions 工作流，每次 push 代码到仓库后会自动触发构建。
@@ -87,6 +118,7 @@ modern-frontend-app/
 ├── index.html              # HTML 模板
 ├── package.json            # 项目配置
 ├── .npmrc                  # pnpm 配置文件
+├── vercel.json             # Vercel 部署配置
 ├── tsconfig.json           # TypeScript 配置
 ├── vite.config.ts          # Vite 配置
 └── README.md               # 项目说明
