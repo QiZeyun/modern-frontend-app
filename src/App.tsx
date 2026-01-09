@@ -5,7 +5,9 @@ import * as XLSX from 'xlsx'
 type MatchType = 'exact' | 'raw'
 
 type ParsedPair = {
+  studentId: string
   name: string
+  rawStudentId: string
   rawName: string
   score: number
   matchType: MatchType
@@ -15,6 +17,7 @@ type ParsedPair = {
 
 type Entry = {
   id: string
+  studentId: string
   name: string
   score: number | ''
 }
@@ -37,6 +40,23 @@ function isAbortError(e: unknown) {
   return e instanceof DOMException && e.name === 'AbortError'
 }
 
+type RosterItem = {
+  studentId: string
+  name: string
+}
+
+function rosterItemsToText(items: RosterItem[]) {
+  return items
+    .map((it) => {
+      const id = normalizeStudentId(it.studentId)
+      const name = normalizeStudentName(it.name)
+      if (!name) return ''
+      return id ? `${id}\t${name}` : name
+    })
+    .filter(Boolean)
+    .join('\n')
+}
+
 function safeTodayISO() {
   const now = new Date()
   const yyyy = String(now.getFullYear())
@@ -50,11 +70,79 @@ function uid() {
   return `${Date.now()}_${Math.random().toString(16).slice(2)}`
 }
 
-function normalizeRoster(text: string) {
-  return text
+function normalizeStudentId(raw: string) {
+  return raw.replace(/[^\d]/g, '').trim()
+}
+
+function normalizeStudentName(raw: string) {
+  const cleaned = raw
+    .trim()
+    .replace(/[，,。.\t]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^\d+\s*/g, '') // strip leading index
+    .replace(/^(姓名|名字|学号|學號)[:：]\s*/g, '')
+    .replace(/(同学|同學)$/g, '')
+    .trim()
+
+  const onlyZh = cleaned.replace(/[^\u4e00-\u9fa5]/g, '')
+  return (onlyZh || cleaned).trim()
+}
+
+function parseRosterLine(line: string): RosterItem | null {
+  const s = line.trim()
+  if (!s) return null
+  // Common patterns:
+  // - "202401 张三"
+  // - "张三 202401"
+  // - "张三"
+  const tokens = s.split(/[\s,，;；]+/g).filter(Boolean)
+  let id = ''
+  let name = ''
+
+  for (const t of tokens) {
+    const maybeId = normalizeStudentId(t)
+    const maybeName = normalizeStudentName(t)
+    if (!id && maybeId && maybeId.length >= 4) id = maybeId
+    if (!name && maybeName && /[\u4e00-\u9fa5]{2,8}/.test(maybeName)) name = maybeName
+  }
+
+  if (!name) {
+    // fallback: try extracting name from whole line
+    const n = normalizeStudentName(s)
+    if (n && /[\u4e00-\u9fa5]{2,8}/.test(n)) name = n
+  }
+  if (!id) {
+    // fallback: first long digit sequence
+    const m = s.match(/\d{4,}/)
+    if (m) id = normalizeStudentId(m[0])
+  }
+  if (!name) return null
+  return { studentId: id, name }
+}
+
+function normalizeRoster(text: string): RosterItem[] {
+  const items = text
     .split(/\r?\n/g)
-    .map((s) => s.trim())
-    .filter(Boolean)
+    .map((s) => parseRosterLine(s))
+    .filter((x): x is RosterItem => Boolean(x))
+
+  // Dedupe: prefer studentId; otherwise by name
+  const byId = new Map<string, RosterItem>()
+  const byName = new Map<string, RosterItem>()
+  for (const it of items) {
+    const id = normalizeStudentId(it.studentId)
+    const name = normalizeStudentName(it.name)
+    const normalized: RosterItem = { studentId: id, name }
+    if (id) byId.set(id, normalized)
+    else byName.set(name, normalized)
+  }
+  const merged = [...byId.values()]
+  for (const it of byName.values()) {
+    // if same name already exists with id, skip
+    if (merged.some((x) => x.name === it.name)) continue
+    merged.push(it)
+  }
+  return merged
 }
 
 function normalizeTranscript(text: string) {
@@ -101,19 +189,6 @@ function normalizeTranscript(text: string) {
   let out = text
   for (const w of noise) out = out.split(w).join(' ')
   return out.replace(/\s+/g, ' ').trim()
-}
-
-function bestNameMatch(rawName: string, roster: string[]) {
-  const cleaned = rawName.replace(/\s+/g, '').replace(/同学|同學/g, '')
-  if (!cleaned) {
-    return { name: rawName, matchType: 'raw' as const, confidence: 0 }
-  }
-  if (roster.includes(cleaned)) {
-    return { name: cleaned, matchType: 'exact' as const, confidence: 1 }
-  }
-  // Important: avoid aggressive fuzzy matching that may mis-identify students.
-  // If not an exact match, keep raw and let AI (or user) decide.
-  return { name: cleaned, matchType: 'raw' as const, confidence: 0 }
 }
 
 function chineseToNumber(raw: string) {
@@ -179,25 +254,47 @@ function clampScore(n: number) {
   return n
 }
 
-function parsePairsFromText(text: string, roster: string[]): ParsedPair[] {
+function parsePairsFromText(text: string, roster: RosterItem[]): ParsedPair[] {
   const normalized = normalizeTranscript(text)
   if (!normalized) return []
 
   const results: ParsedPair[] = []
-  // e.g. "张三 95" / "李四九十五分" / "王五 得 88"
+  // e.g.
+  // - "张三 95"
+  // - "202401 95"
+  // - "李四九十五分"
   const re =
-    /([\u4e00-\u9fa5]{2,8})\s*(?:得|是|为)?\s*([0-9]{1,3}|[零〇一二两三四五六七八九十百]{1,6})\s*(?:分)?/g
+    /((?:\d{4,}|[\u4e00-\u9fa5]{2,8}))\s*(?:得|是|为)?\s*([0-9]{1,3}|[零〇一二两三四五六七八九十百]{1,6})\s*(?:分)?/g
   for (const match of normalized.matchAll(re)) {
-    const rawName = (match[1] ?? '').trim()
+    const rawIdOrName = (match[1] ?? '').trim()
     const rawScore = (match[2] ?? '').trim()
     const num = chineseToNumber(rawScore)
     if (num === null) continue
     const score = clampScore(num)
     if (score === null) continue
 
-    const matched = bestNameMatch(rawName, roster)
+    const rawStudentId = normalizeStudentId(rawIdOrName)
+    const rawName = normalizeStudentName(rawIdOrName)
+
+    let matched: { studentId: string; name: string; matchType: MatchType; confidence: number } = {
+      studentId: rawStudentId,
+      name: rawName || rawIdOrName,
+      matchType: 'raw',
+      confidence: 0,
+    }
+
+    if (rawStudentId) {
+      const byId = roster.find((r) => r.studentId && r.studentId === rawStudentId)
+      if (byId) matched = { studentId: byId.studentId, name: byId.name, matchType: 'exact', confidence: 1 }
+    } else if (rawName) {
+      const byName = roster.find((r) => r.name === rawName)
+      if (byName) matched = { studentId: byName.studentId, name: byName.name, matchType: 'exact', confidence: 1 }
+    }
+
     results.push({
+      studentId: matched.studentId,
       name: matched.name,
+      rawStudentId,
       rawName,
       score,
       matchType: matched.matchType,
@@ -206,10 +303,13 @@ function parsePairsFromText(text: string, roster: string[]): ParsedPair[] {
     })
   }
 
-  // De-duplicate by name, keep the latest occurrence (teachers often re-read corrections)
-  const byName = new Map<string, ParsedPair>()
-  for (const item of results) byName.set(item.name, item)
-  return Array.from(byName.values())
+  // De-duplicate by studentId if available, else by name
+  const byKey = new Map<string, ParsedPair>()
+  for (const item of results) {
+    const key = item.studentId ? `id:${item.studentId}` : `name:${item.name}`
+    byKey.set(key, item)
+  }
+  return Array.from(byKey.values())
 }
 
 function exportToExcel(params: {
@@ -220,19 +320,26 @@ function exportToExcel(params: {
   const { date, homeworkTitle, entries } = params
   const clean = entries
     .filter((e) => e.name.trim() && e.score !== '')
-    .map((e) => ({ name: e.name.trim(), score: Number(e.score) }))
-    .sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'))
+    .map((e) => ({ studentId: e.studentId.trim(), name: e.name.trim(), score: Number(e.score) }))
+    .sort((a, b) => {
+      const aid = a.studentId || ''
+      const bid = b.studentId || ''
+      if (aid && bid) return aid.localeCompare(bid, 'en')
+      if (aid) return -1
+      if (bid) return 1
+      return a.name.localeCompare(b.name, 'zh-Hans-CN')
+    })
 
   const aoa: (string | number)[][] = [
     ['语文作业成绩登记表'],
     ['日期', date, '作业', homeworkTitle || '（未填写）'],
     [],
-    ['姓名', '成绩'],
-    ...clean.map((r) => [r.name, r.score]),
+    ['学号', '姓名', '成绩'],
+    ...clean.map((r) => [r.studentId, r.name, r.score]),
   ]
 
   const ws = XLSX.utils.aoa_to_sheet(aoa)
-  ws['!cols'] = [{ wch: 14 }, { wch: 8 }, { wch: 10 }, { wch: 24 }]
+  ws['!cols'] = [{ wch: 14 }, { wch: 14 }, { wch: 8 }, { wch: 24 }]
   const wb = XLSX.utils.book_new()
   XLSX.utils.book_append_sheet(wb, ws, '登记表')
 
@@ -240,32 +347,36 @@ function exportToExcel(params: {
   XLSX.writeFile(wb, filename)
 }
 
-function normalizeNameCandidate(name: string) {
-  const cleaned = name
-    .trim()
-    .replace(/[，,。.\t]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .replace(/^\d+\s*/g, '') // strip leading index
-    .replace(/^(姓名|名字)[:：]\s*/g, '')
-    .replace(/(同学|同學)$/g, '')
-    .trim()
-
-  // Keep only Chinese characters for roster names (most classes use Chinese names)
-  const onlyZh = cleaned.replace(/[^\u4e00-\u9fa5]/g, '')
-  return (onlyZh || cleaned).trim()
-}
-
 function uniqueNames(names: string[]) {
   const seen = new Set<string>()
   const out: string[] = []
   for (const n of names) {
-    const cleaned = normalizeNameCandidate(n)
+    const cleaned = normalizeStudentName(n)
     if (!cleaned) continue
     if (seen.has(cleaned)) continue
     seen.add(cleaned)
     out.push(cleaned)
   }
   return out
+}
+
+function uniqueRosterItems(items: RosterItem[]) {
+  const byId = new Map<string, RosterItem>()
+  const byName = new Map<string, RosterItem>()
+  for (const it of items) {
+    const id = normalizeStudentId(it.studentId)
+    const name = normalizeStudentName(it.name)
+    if (!name) continue
+    const normalized: RosterItem = { studentId: id, name }
+    if (id) byId.set(id, normalized)
+    else byName.set(name, normalized)
+  }
+  const merged = [...byId.values()]
+  for (const it of byName.values()) {
+    if (merged.some((x) => x.name === it.name)) continue
+    merged.push(it)
+  }
+  return merged
 }
 
 function extractJsonArrayFromText(text: string) {
@@ -284,9 +395,9 @@ async function geminiParseHomeworkScores(params: {
   apiKey: string
   model: string
   transcript: string
-  roster: string[]
+  roster: RosterItem[]
   signal?: AbortSignal
-}): Promise<Array<{ name: string; score: number }>> {
+}): Promise<Array<{ studentId: string; name: string; score: number }>> {
   const { apiKey, model, transcript, roster, signal } = params
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     model,
@@ -294,13 +405,14 @@ async function geminiParseHomeworkScores(params: {
 
   const prompt = [
     '你是语文老师的“作业成绩语音录入助手”。',
-    '给你两份输入：1) 花名册（学生姓名列表） 2) 老师口述成绩的识别文本。',
-    '任务：从识别文本中提取每个学生的成绩，并把姓名映射为花名册中的姓名。',
+    '给你两份输入：1) 花名册（包含学号 studentId 与姓名 name）2) 老师口述成绩的识别文本。',
+    '任务：从识别文本中提取每个学生的成绩，并把“学号或姓名”映射为花名册中的学生。',
     '',
     '强约束：',
     '1) 只输出 JSON 数组，不要任何额外文字',
-    '2) 数组元素是对象：{"name": "<花名册中的姓名>", "score": <0-100整数>}',
-    '3) name 必须严格来自花名册；不确定就忽略该条（不要编造）',
+    '2) 数组元素是对象：{"studentId":"<花名册里的studentId，可为空字符串>","name":"<花名册里的name>","score":<0-100整数>}',
+    '3) name 必须严格来自花名册；studentId 必须与该 name 对应（若花名册中该学生学号为空，则 studentId 也输出空字符串）',
+    '4) 允许老师用“学号”或“姓名”报分；但输出必须是花名册中的标准记录',
     '4) 同一学生出现多次取“最后一次”成绩',
     '5) 过滤噪声词（如：语文/作业/成绩/分数/今天/同学/得了/是/为等）',
     '',
@@ -349,20 +461,40 @@ async function geminiParseHomeworkScores(params: {
   const parsed = JSON.parse(jsonArr) as unknown
   if (!Array.isArray(parsed)) return []
 
-  const rosterSet = new Set(roster)
-  const byName = new Map<string, number>()
+  const rosterByName = new Map<string, RosterItem>()
+  const rosterById = new Map<string, RosterItem>()
+  for (const r of roster) {
+    if (r.name) rosterByName.set(r.name, r)
+    if (r.studentId) rosterById.set(r.studentId, r)
+  }
+
+  const byKey = new Map<string, { studentId: string; name: string; score: number }>()
   for (const item of parsed) {
     if (!item || typeof item !== 'object') continue
-    const name = String((item as { name?: unknown }).name ?? '').trim()
+    const name = normalizeStudentName(String((item as { name?: unknown }).name ?? ''))
+    const studentId = normalizeStudentId(String((item as { studentId?: unknown }).studentId ?? ''))
     const scoreRaw = (item as { score?: unknown }).score
     const scoreNum = typeof scoreRaw === 'number' ? scoreRaw : Number(scoreRaw)
-    if (!name || !rosterSet.has(name)) continue
+    if (!name) continue
     if (!Number.isFinite(scoreNum)) continue
     const s = clampScore(Math.round(scoreNum))
     if (s === null) continue
-    byName.set(name, s)
+
+    const matchedById = studentId ? rosterById.get(studentId) : undefined
+    const matchedByName = rosterByName.get(name)
+    const matched = matchedById ?? matchedByName
+    if (!matched) continue
+
+    // Ensure name aligns with roster record
+    if (matched.name !== name) continue
+    // Ensure id aligns with roster record (unless roster has no id)
+    if (matched.studentId && matched.studentId !== studentId) continue
+
+    const outId = matched.studentId || ''
+    const key = outId ? `id:${outId}` : `name:${matched.name}`
+    byKey.set(key, { studentId: outId, name: matched.name, score: s })
   }
-  return Array.from(byName.entries()).map(([name, score]) => ({ name, score }))
+  return Array.from(byKey.values())
 }
 
 async function geminiExtractRosterNamesWithExclusions(params: {
@@ -529,6 +661,18 @@ function App() {
   })
 
   const roster = useMemo(() => normalizeRoster(rosterText), [rosterText])
+  const rosterNames = useMemo(() => roster.map((r) => r.name), [roster])
+  const rosterIds = useMemo(() => roster.map((r) => r.studentId).filter(Boolean), [roster])
+  const rosterById = useMemo(() => {
+    const m = new Map<string, RosterItem>()
+    for (const r of roster) if (r.studentId) m.set(r.studentId, r)
+    return m
+  }, [roster])
+  const rosterNameCounts = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const r of roster) m.set(r.name, (m.get(r.name) ?? 0) + 1)
+    return m
+  }, [roster])
 
   const [geminiApiKey, setGeminiApiKey] = useState(() => {
     const envKey = import.meta.env.VITE_GEMINI_API_KEY
@@ -772,7 +916,7 @@ function App() {
     setRosterAiLoading(true)
     try {
       const existing = uniqueNames([
-        ...normalizeRoster(rosterTextRef.current),
+        ...normalizeRoster(rosterTextRef.current).map((r) => r.name),
         ...rosterVoiceNewNamesRef.current,
       ])
       const names = await geminiExtractRosterNamesWithExclusions({
@@ -786,7 +930,11 @@ function App() {
 
       setRosterVoiceNewNames((prev) => uniqueNames([...prev, ...names]))
       if (rosterVoiceAutoApplyRef.current) {
-        setRosterText((prev) => uniqueNames([...normalizeRoster(prev), ...names]).join('\n'))
+        setRosterText((prev) =>
+          rosterItemsToText(
+            uniqueRosterItems([...normalizeRoster(prev), ...names.map((n) => ({ studentId: '', name: n }))]),
+          ),
+        )
       }
       setRosterVoiceStatus(
         `已新增 ${names.length} 人（本次累计 ${uniqueNames([...rosterVoiceNewNamesRef.current, ...names]).length} 人）。`,
@@ -881,11 +1029,18 @@ function App() {
         })
         setEntries((prev) => {
           const map = new Map<string, Entry>()
-          for (const e of prev) map.set(e.name.trim(), e)
+          for (const e of prev) {
+            const key0 = e.studentId ? `id:${e.studentId.trim()}` : `name:${e.name.trim()}`
+            map.set(key0, e)
+          }
           for (const p of pairs) {
-            const existing = map.get(p.name)
-            if (existing) map.set(p.name, { ...existing, score: p.score })
-            else map.set(p.name, { id: uid(), name: p.name, score: p.score })
+            const key0 = p.studentId ? `id:${p.studentId}` : `name:${p.name}`
+            const existing = map.get(key0)
+            if (existing) {
+              map.set(key0, { ...existing, studentId: p.studentId, name: p.name, score: p.score })
+            } else {
+              map.set(key0, { id: uid(), studentId: p.studentId, name: p.name, score: p.score })
+            }
           }
           return Array.from(map.values())
         })
@@ -896,13 +1051,19 @@ function App() {
         // Fallback to local parsing (no fuzzy mapping)
         setEntries((prev) => {
           const map = new Map<string, Entry>()
-          for (const e0 of prev) map.set(e0.name.trim(), e0)
+          for (const e0 of prev) {
+            const key0 = e0.studentId ? `id:${e0.studentId.trim()}` : `name:${e0.name.trim()}`
+            map.set(key0, e0)
+          }
           for (const p of parsedLive) {
-            const key0 = p.name.trim()
-            if (!key0) continue
+            const key0 = p.studentId ? `id:${p.studentId}` : `name:${p.name.trim()}`
+            if (!key0 || key0 === 'name:') continue
             const existing = map.get(key0)
-            if (existing) map.set(key0, { ...existing, score: p.score })
-            else map.set(key0, { id: uid(), name: key0, score: p.score })
+            if (existing) {
+              map.set(key0, { ...existing, studentId: p.studentId, name: p.name, score: p.score })
+            } else {
+              map.set(key0, { id: uid(), studentId: p.studentId, name: p.name, score: p.score })
+            }
           }
           return Array.from(map.values())
         })
@@ -915,13 +1076,19 @@ function App() {
     // Local fallback: merge parsed results into editable table (no aggressive fuzzy matching)
     setEntries((prev) => {
       const map = new Map<string, Entry>()
-      for (const e of prev) map.set(e.name.trim(), e)
+      for (const e of prev) {
+        const key0 = e.studentId ? `id:${e.studentId.trim()}` : `name:${e.name.trim()}`
+        map.set(key0, e)
+      }
       for (const p of parsedLive) {
-        const key0 = p.name.trim()
-        if (!key0) continue
+        const key0 = p.studentId ? `id:${p.studentId}` : `name:${p.name.trim()}`
+        if (!key0 || key0 === 'name:') continue
         const existing = map.get(key0)
-        if (existing) map.set(key0, { ...existing, score: p.score })
-        else map.set(key0, { id: uid(), name: key0, score: p.score })
+        if (existing) {
+          map.set(key0, { ...existing, studentId: p.studentId, name: p.name, score: p.score })
+        } else {
+          map.set(key0, { id: uid(), studentId: p.studentId, name: p.name, score: p.score })
+        }
       }
       return Array.from(map.values())
     })
@@ -936,7 +1103,7 @@ function App() {
     setEntries([])
   }
 
-  const addEmptyRow = () => setEntries((prev) => [...prev, { id: uid(), name: '', score: '' }])
+  const addEmptyRow = () => setEntries((prev) => [...prev, { id: uid(), studentId: '', name: '', score: '' }])
 
   const exportNow = () => exportToExcel({ date, homeworkTitle, entries })
 
@@ -990,11 +1157,12 @@ function App() {
       return
     }
     const current = normalizeRoster(rosterText)
+    const incoming = geminiPreview.map((name) => ({ studentId: '', name }))
     const next =
       geminiMode === 'replace'
-        ? uniqueNames(geminiPreview)
-        : uniqueNames([...current, ...geminiPreview])
-    setRosterText(next.join('\n'))
+        ? uniqueRosterItems(incoming)
+        : uniqueRosterItems([...current, ...incoming])
+    setRosterText(rosterItemsToText(next))
     setGeminiStatus(`已${geminiMode === 'replace' ? '替换' : '追加'}到花名册：当前 ${next.length} 人。`)
   }
 
@@ -1076,7 +1244,7 @@ function App() {
               disabled={!geminiApiKey.trim()}
             />
             <span>
-              结束保存时用 Gemini 基于花名册做姓名匹配（更准确，需填写 API Key）
+              结束保存时用 Gemini 基于花名册（学号/姓名）做匹配（更准确，需填写 API Key）
               {geminiMatchLoading ? '（匹配中…）' : ''}
             </span>
           </label>
@@ -1090,7 +1258,7 @@ function App() {
             value={rosterText}
             onChange={(e) => setRosterText(e.target.value)}
             rows={7}
-            placeholder="每行一个姓名，例如：\n张三\n李四\n王五"
+            placeholder="每行一个学生：学号(可选) + 姓名，例如：\n202401\t张三\n202402 李四\n王五"
           />
           <div className="tiny">当前花名册人数：{roster.length}</div>
 
@@ -1268,12 +1436,13 @@ function App() {
             <div className="panel-title">实时解析预览（只读）</div>
             <div className="panel-subtitle">结束后点“保存到登记表”即可进入可编辑状态。</div>
             {parsedLive.length === 0 ? (
-              <div className="empty">（尚未解析到“姓名-成绩”）</div>
+              <div className="empty">（尚未解析到“姓名/学号-成绩”）</div>
             ) : (
               <div className="preview">
                 {parsedLive.map((p) => (
-                  <div key={`${p.name}_${p.score}`} className="preview-row">
+                  <div key={`${p.studentId || p.name}_${p.score}`} className="preview-row">
                     <div className="preview-name">
+                      {p.studentId ? `${p.studentId} ` : ''}
                       {p.name}
                       <span className={`tag tag-${p.matchType}`}>
                         {p.matchType === 'exact'
@@ -1292,7 +1461,7 @@ function App() {
         <section className="panel">
           <div className="panel-title">结构化数据：今日登记表（可编辑）</div>
           <div className="panel-subtitle">
-            可直接修改姓名/成绩；姓名输入框支持花名册联想。
+            可直接修改学号/姓名/成绩；学号或姓名输入框支持花名册联想（姓名重名时建议用学号）。
           </div>
 
           <div className="table-actions">
@@ -1305,8 +1474,13 @@ function App() {
           </div>
 
           <datalist id="rosterNames">
-            {roster.map((n) => (
+            {rosterNames.map((n) => (
               <option key={n} value={n} />
+            ))}
+          </datalist>
+          <datalist id="rosterIds">
+            {rosterIds.map((id) => (
+              <option key={id} value={id} />
             ))}
           </datalist>
 
@@ -1315,6 +1489,7 @@ function App() {
           ) : (
             <div className="table">
               <div className="table-head">
+                <div>学号</div>
                 <div>姓名</div>
                 <div>成绩（0-100）</div>
                 <div />
@@ -1323,12 +1498,45 @@ function App() {
                 <div className="table-row" key={row.id}>
                   <input
                     className="input"
+                    list="rosterIds"
+                    value={row.studentId}
+                    onChange={(e) => {
+                      const nextId = normalizeStudentId(e.target.value)
+                      const matched = nextId ? rosterById.get(nextId) : undefined
+                      setEntries((prev) =>
+                        prev.map((r) =>
+                          r.id === row.id
+                            ? {
+                                ...r,
+                                studentId: nextId,
+                                name: matched ? matched.name : r.name,
+                              }
+                            : r,
+                        ),
+                      )
+                    }}
+                    placeholder="例如：202401"
+                  />
+                  <input
+                    className="input"
                     list="rosterNames"
                     value={row.name}
                     onChange={(e) =>
-                      setEntries((prev) =>
-                        prev.map((r) => (r.id === row.id ? { ...r, name: e.target.value } : r)),
-                      )
+                      setEntries((prev) => {
+                        const nextName = normalizeStudentName(e.target.value)
+                        const count = rosterNameCounts.get(nextName) ?? 0
+                        const matched =
+                          nextName && count === 1 ? roster.find((x) => x.name === nextName) : undefined
+                        return prev.map((r) =>
+                          r.id === row.id
+                            ? {
+                                ...r,
+                                name: e.target.value,
+                                studentId: matched ? matched.studentId : r.studentId,
+                              }
+                            : r,
+                        )
+                      })
                     }
                     placeholder="例如：张三"
                   />
@@ -1365,7 +1573,7 @@ function App() {
 
       <footer className="footer">
         <div className="tiny">
-          说明：本页面使用浏览器 Web Speech API（常见于 Chrome）进行语音转写，并用花名册做模糊匹配与噪声过滤；你可以在导出前手动修正登记表内容。
+          说明：本页面使用浏览器 Web Speech API（常见于 Chrome）进行语音转写；结束保存时可用 Gemini 基于花名册（学号/姓名）做匹配，从而降低误识别；你可以在导出前手动修正登记表内容。
         </div>
       </footer>
     </div>

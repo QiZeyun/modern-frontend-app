@@ -285,7 +285,7 @@
 .table-head,
 .table-row {
   display: grid;
-  grid-template-columns: 1fr 160px 90px;
+  grid-template-columns: 140px 1fr 160px 90px;
   gap: 10px;
   align-items: center;
   padding: 10px 12px;
@@ -402,6 +402,6 @@
   }
   .table-head,
   .table-row {
-    grid-template-columns: 1fr 120px 80px;
+    grid-template-columns: 110px 1fr 110px 72px;
   }
 }
