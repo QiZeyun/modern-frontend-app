@@ -45,6 +45,12 @@
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
 }
 
+.panel.inset {
+  box-shadow: none;
+  border-color: rgba(15, 23, 42, 0.12);
+  background: rgba(255, 255, 255, 0.72);
+}
+
 .panel-title {
   font-weight: 700;
   color: #0f172a;
@@ -317,6 +323,25 @@
   margin: 14px 0;
   height: 1px;
   background: rgba(15, 23, 42, 0.08);
+}
+
+.chips {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  background: rgba(15, 23, 42, 0.03);
+  color: rgba(15, 23, 42, 0.84);
+  font-size: 12px;
+  font-weight: 650;
 }
 
 .ai-grid {

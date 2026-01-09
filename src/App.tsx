@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import * as XLSX from 'xlsx'
 
@@ -365,6 +365,83 @@ async function geminiParseHomeworkScores(params: {
   return Array.from(byName.entries()).map(([name, score]) => ({ name, score }))
 }
 
+async function geminiExtractRosterNamesWithExclusions(params: {
+  apiKey: string
+  model: string
+  inputText: string
+  existingNames: string[]
+  signal?: AbortSignal
+}): Promise<string[]> {
+  const { apiKey, model, inputText, existingNames, signal } = params
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    model,
+  )}:generateContent?key=${encodeURIComponent(apiKey)}`
+
+  const prompt = [
+    '你是一个帮助语文老师整理“花名册”的助手。',
+    '任务：从用户提供的原始文本中提取学生姓名，输出 JSON 数组（只输出 JSON，不要多余文字）。',
+    '',
+    '强约束：',
+    '1) 只输出 JSON 数组，例如：["张三","李四"]',
+    '2) 去除序号、班级、学号、括号备注、标点，保留姓名本体',
+    '3) 过滤明显非姓名的词（如“语文/作业/成绩/名单/男/女/缺勤”等）',
+    '4) 不要输出重复姓名',
+    `5) 不要输出已存在的姓名（已有名单）：${JSON.stringify(existingNames)}`,
+    '6) 如果无法确定，请保守处理，不要编造姓名',
+    '',
+    '原始文本：',
+    inputText,
+  ].join('\n')
+
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.2,
+        topP: 0.9,
+        maxOutputTokens: 1024,
+      },
+    }),
+  })
+
+  if (!res.ok) {
+    let details = ''
+    try {
+      details = JSON.stringify(await res.json())
+    } catch {
+      details = await res.text()
+    }
+    throw new Error(`Gemini API 请求失败：HTTP ${res.status} ${res.statusText}${details ? ` - ${details}` : ''}`)
+  }
+
+  const data = (await res.json()) as GeminiGenerateContentResponse
+  const parts = data.candidates?.[0]?.content?.parts ?? []
+  const text = parts
+    .map((p) => p.text ?? '')
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .join('\n')
+
+  const jsonArr = extractJsonArrayFromText(text)
+  if (jsonArr) {
+    try {
+      const parsed = JSON.parse(jsonArr) as unknown
+      if (Array.isArray(parsed)) return uniqueNames(parsed.map((x) => String(x)))
+    } catch {
+      // fallthrough to line parsing
+    }
+  }
+
+  const fallback = text
+    .split(/\r?\n/g)
+    .map((s: string) => s.trim())
+    .filter(Boolean)
+  return uniqueNames(fallback)
+}
+
 async function geminiExtractRosterNames(params: {
   apiKey: string
   model: string
@@ -477,6 +554,25 @@ function App() {
   const [geminiMatchLoading, setGeminiMatchLoading] = useState(false)
   const [geminiMatchStatus, setGeminiMatchStatus] = useState('')
 
+  // AI realtime roster via voice
+  const [rosterVoiceOn, setRosterVoiceOn] = useState(false)
+  const [rosterVoiceFinal, setRosterVoiceFinal] = useState('')
+  const [rosterVoiceInterim, setRosterVoiceInterim] = useState('')
+  const [rosterVoiceStatus, setRosterVoiceStatus] = useState('')
+  const [rosterVoiceAutoApply, setRosterVoiceAutoApply] = useState(true)
+  const [rosterVoiceNewNames, setRosterVoiceNewNames] = useState<string[]>([])
+  const rosterVoiceSnapshotRef = useRef<string>('')
+  const rosterRecognitionRef = useRef<SpeechRecognition | null>(null)
+  const rosterAiTimerRef = useRef<number | null>(null)
+  const rosterAiAbortRef = useRef<AbortController | null>(null)
+  const rosterAiLastHashRef = useRef<string>('')
+  const [rosterAiLoading, setRosterAiLoading] = useState(false)
+  const rosterTextRef = useRef(rosterText)
+  const rosterVoiceNewNamesRef = useRef<string[]>([])
+  const rosterVoiceAutoApplyRef = useRef(rosterVoiceAutoApply)
+  const geminiKeyRef = useRef(geminiApiKey)
+  const geminiModelRef = useRef(geminiModel)
+
   const [isRecording, setIsRecording] = useState(false)
   const [status, setStatus] = useState<string>('')
   const [finalText, setFinalText] = useState('')
@@ -495,6 +591,26 @@ function App() {
   useEffect(() => {
     localStorage.setItem('rosterText', rosterText)
   }, [rosterText])
+
+  useEffect(() => {
+    rosterTextRef.current = rosterText
+  }, [rosterText])
+
+  useEffect(() => {
+    rosterVoiceNewNamesRef.current = rosterVoiceNewNames
+  }, [rosterVoiceNewNames])
+
+  useEffect(() => {
+    rosterVoiceAutoApplyRef.current = rosterVoiceAutoApply
+  }, [rosterVoiceAutoApply])
+
+  useEffect(() => {
+    geminiKeyRef.current = geminiApiKey
+  }, [geminiApiKey])
+
+  useEffect(() => {
+    geminiModelRef.current = geminiModel
+  }, [geminiModel])
 
   useEffect(() => {
     localStorage.setItem('geminiModelPreset', geminiModelPreset)
@@ -522,6 +638,11 @@ function App() {
       recognitionRef.current = null
       geminiAbortRef.current?.abort()
       geminiAbortRef.current = null
+      rosterRecognitionRef.current?.abort()
+      rosterRecognitionRef.current = null
+      rosterAiAbortRef.current?.abort()
+      rosterAiAbortRef.current = null
+      if (rosterAiTimerRef.current) window.clearTimeout(rosterAiTimerRef.current)
     }
   }, [])
 
@@ -562,6 +683,43 @@ function App() {
     return rec
   }
 
+  const ensureRosterRecognition = () => {
+    if (rosterRecognitionRef.current) return rosterRecognitionRef.current
+    const Ctor = window.SpeechRecognition ?? window.webkitSpeechRecognition
+    if (!Ctor) return null
+
+    const rec = new Ctor()
+    rec.lang = 'zh-CN'
+    rec.continuous = true
+    rec.interimResults = true
+    rec.maxAlternatives = 1
+
+    rec.onresult = (ev) => {
+      let interim = ''
+      let appendedFinal = ''
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const res = ev.results[i]
+        const transcript = res[0]?.transcript ?? ''
+        if (res.isFinal) appendedFinal += transcript
+        else interim += transcript
+      }
+      if (appendedFinal) setRosterVoiceFinal((prev) => (prev ? `${prev} ${appendedFinal}` : appendedFinal))
+      setRosterVoiceInterim(interim)
+    }
+
+    rec.onerror = (ev) => {
+      setRosterVoiceStatus(`语音识别错误：${ev.error}${ev.message ? `（${ev.message}）` : ''}`)
+      setRosterVoiceOn(false)
+    }
+
+    rec.onend = () => {
+      setRosterVoiceOn(false)
+    }
+
+    rosterRecognitionRef.current = rec
+    return rec
+  }
+
   const start = () => {
     setStatus('')
     if (!supported) {
@@ -583,6 +741,117 @@ function App() {
       setIsRecording(false)
       setStatus('启动识别失败：请稍后再试（或刷新页面）。')
     }
+  }
+
+  const rosterVoiceLiveText = (rosterVoiceFinal + ' ' + rosterVoiceInterim).trim()
+
+  const runRosterAiExtractNow = useCallback(async (text: string) => {
+    setRosterVoiceStatus('')
+    const key = geminiKeyRef.current.trim()
+    if (!key) {
+      setRosterVoiceStatus('请先填写 Gemini API Key（用于 AI 实时提取姓名）。')
+      return
+    }
+    const model = geminiModelRef.current
+    if (!model) {
+      setRosterVoiceStatus('请先选择 Gemini 模型。')
+      return
+    }
+    if (!text.trim()) return
+
+    // Very small "hash" to avoid repeated calls when transcript doesn't change meaningfully
+    const compact = text.replace(/\s+/g, '').slice(-1800)
+    const hash = `${compact.length}:${compact.slice(0, 40)}:${compact.slice(-40)}`
+    if (hash === rosterAiLastHashRef.current) return
+    rosterAiLastHashRef.current = hash
+
+    rosterAiAbortRef.current?.abort()
+    const ac = new AbortController()
+    rosterAiAbortRef.current = ac
+
+    setRosterAiLoading(true)
+    try {
+      const existing = uniqueNames([
+        ...normalizeRoster(rosterTextRef.current),
+        ...rosterVoiceNewNamesRef.current,
+      ])
+      const names = await geminiExtractRosterNamesWithExclusions({
+        apiKey: key,
+        model,
+        inputText: text,
+        existingNames: existing,
+        signal: ac.signal,
+      })
+      if (!names.length) return
+
+      setRosterVoiceNewNames((prev) => uniqueNames([...prev, ...names]))
+      if (rosterVoiceAutoApplyRef.current) {
+        setRosterText((prev) => uniqueNames([...normalizeRoster(prev), ...names]).join('\n'))
+      }
+      setRosterVoiceStatus(
+        `已新增 ${names.length} 人（本次累计 ${uniqueNames([...rosterVoiceNewNamesRef.current, ...names]).length} 人）。`,
+      )
+    } catch (e) {
+      if (isAbortError(e)) return
+      setRosterVoiceStatus((e as Error).message || 'Gemini 提取失败。')
+    } finally {
+      setRosterAiLoading(false)
+    }
+  }, [])
+
+  // Schedule AI extraction while speech is changing (debounced)
+  useEffect(() => {
+    if (!rosterVoiceOn) return
+    const text = rosterVoiceLiveText
+    if (!text) return
+    if (rosterAiTimerRef.current) window.clearTimeout(rosterAiTimerRef.current)
+    rosterAiTimerRef.current = window.setTimeout(() => {
+      void runRosterAiExtractNow(rosterVoiceFinal.trim() || text)
+    }, 3500)
+  }, [rosterVoiceOn, rosterVoiceLiveText, rosterVoiceFinal, runRosterAiExtractNow])
+
+  const startRosterVoice = () => {
+    setRosterVoiceStatus('')
+    if (!supported) {
+      setRosterVoiceStatus('当前浏览器不支持 Web Speech API（建议使用 Chrome）。')
+      return
+    }
+    if (isRecording) {
+      setRosterVoiceStatus('当前正在进行“成绩录音”，请先结束后再录入花名册。')
+      return
+    }
+    const rec = ensureRosterRecognition()
+    if (!rec) {
+      setRosterVoiceStatus('初始化语音识别失败。')
+      return
+    }
+    rosterVoiceSnapshotRef.current = rosterText
+    setRosterVoiceFinal('')
+    setRosterVoiceInterim('')
+    setRosterVoiceNewNames([])
+    rosterAiLastHashRef.current = ''
+    setRosterVoiceOn(true)
+    try {
+      rec.start()
+    } catch {
+      setRosterVoiceOn(false)
+      setRosterVoiceStatus('启动识别失败：请稍后再试（或刷新页面）。')
+    }
+  }
+
+  const stopRosterVoice = async () => {
+    setRosterVoiceStatus('')
+    rosterRecognitionRef.current?.stop()
+    setRosterVoiceOn(false)
+    if (rosterAiTimerRef.current) window.clearTimeout(rosterAiTimerRef.current)
+    // flush one last extraction with final transcript
+    if (rosterVoiceFinal.trim()) await runRosterAiExtractNow(rosterVoiceFinal.trim())
+  }
+
+  const undoRosterVoice = () => {
+    setRosterText(rosterVoiceSnapshotRef.current)
+    setRosterVoiceStatus('已撤销本次花名册语音录入。')
+    setRosterVoiceNewNames([])
   }
 
   const stopAndSave = async () => {
@@ -824,6 +1093,66 @@ function App() {
             placeholder="每行一个姓名，例如：\n张三\n李四\n王五"
           />
           <div className="tiny">当前花名册人数：{roster.length}</div>
+
+          <div className="divider" />
+          <div className="panel-title">AI 实时语音录入花名册</div>
+          <div className="panel-subtitle">
+            点击开始后直接念学生姓名（可带序号/停顿/重复），系统会实时转写并由 Gemini 提取姓名，自动追加到花名册。
+          </div>
+
+          <div className="controls">
+            <button className="btn btn-primary" onClick={startRosterVoice} disabled={rosterVoiceOn || !supported}>
+              开始语音录入花名册
+            </button>
+            <button className="btn" onClick={() => void stopRosterVoice()} disabled={!rosterVoiceOn}>
+              结束
+            </button>
+            <button className="btn btn-danger" onClick={undoRosterVoice} disabled={!rosterVoiceSnapshotRef.current}>
+              撤销本次录入
+            </button>
+            <div className="pill" aria-live="polite">
+              {rosterVoiceOn ? '录入中…' : '未录入'}
+            </div>
+          </div>
+
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={rosterVoiceAutoApply}
+              onChange={(e) => setRosterVoiceAutoApply(e.target.checked)}
+            />
+            <span>实时写入花名册（自动追加去重）{rosterAiLoading ? '（AI 处理中…）' : ''}</span>
+          </label>
+
+          {rosterVoiceStatus ? (
+            <div className={`hint ${rosterVoiceStatus.includes('失败') || rosterVoiceStatus.includes('错误') ? 'danger' : ''}`}>
+              {rosterVoiceStatus}
+            </div>
+          ) : null}
+
+          <div className="grid2">
+            <section className="panel inset">
+              <div className="panel-title">实时转写（花名册）</div>
+              <div className="transcript">
+                <div className="transcript-final">{rosterVoiceFinal || '（等待识别结果…）'}</div>
+                {rosterVoiceInterim ? <div className="transcript-interim">{rosterVoiceInterim}</div> : null}
+              </div>
+            </section>
+            <section className="panel inset">
+              <div className="panel-title">本次新增姓名（AI 提取）</div>
+              {rosterVoiceNewNames.length === 0 ? (
+                <div className="empty">（尚未提取到姓名）</div>
+              ) : (
+                <div className="chips">
+                  {rosterVoiceNewNames.map((n) => (
+                    <span className="chip" key={n}>
+                      {n}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
 
           <div className="divider" />
           <div className="panel-title">Gemini 辅助录入花名册（可选）</div>
