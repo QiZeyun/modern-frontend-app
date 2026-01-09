@@ -19,6 +19,22 @@ type Entry = {
   score: number | ''
 }
 
+type GeminiRosterMode = 'append' | 'replace'
+
+type GeminiGenerateContentResponse = {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{
+        text?: string
+      }>
+    }
+  }>
+}
+
+function isAbortError(e: unknown) {
+  return e instanceof DOMException && e.name === 'AbortError'
+}
+
 function safeTodayISO() {
   const now = new Date()
   const yyyy = String(now.getFullYear())
@@ -254,6 +270,121 @@ function exportToExcel(params: {
   XLSX.writeFile(wb, filename)
 }
 
+function normalizeNameCandidate(name: string) {
+  const cleaned = name
+    .trim()
+    .replace(/[，,。.\t]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^\d+\s*/g, '') // strip leading index
+    .replace(/^(姓名|名字)[:：]\s*/g, '')
+    .replace(/(同学|同學)$/g, '')
+    .trim()
+
+  // Keep only Chinese characters for roster names (most classes use Chinese names)
+  const onlyZh = cleaned.replace(/[^\u4e00-\u9fa5]/g, '')
+  return (onlyZh || cleaned).trim()
+}
+
+function uniqueNames(names: string[]) {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const n of names) {
+    const cleaned = normalizeNameCandidate(n)
+    if (!cleaned) continue
+    if (seen.has(cleaned)) continue
+    seen.add(cleaned)
+    out.push(cleaned)
+  }
+  return out
+}
+
+function extractJsonArrayFromText(text: string) {
+  const trimmed = text.trim()
+  // Prefer full JSON array
+  const firstArr = trimmed.indexOf('[')
+  const lastArr = trimmed.lastIndexOf(']')
+  if (firstArr !== -1 && lastArr !== -1 && lastArr > firstArr) {
+    const json = trimmed.slice(firstArr, lastArr + 1)
+    return json
+  }
+  return null
+}
+
+async function geminiExtractRosterNames(params: {
+  apiKey: string
+  model: string
+  inputText: string
+  signal?: AbortSignal
+}): Promise<string[]> {
+  const { apiKey, model, inputText, signal } = params
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    model,
+  )}:generateContent?key=${encodeURIComponent(apiKey)}`
+
+  const prompt = [
+    '你是一个帮助语文老师整理“花名册”的助手。',
+    '任务：从用户提供的原始文本中提取学生姓名，输出 JSON 数组（只输出 JSON，不要多余文字）。',
+    '',
+    '规则：',
+    '1) 只输出 JSON 数组，例如：["张三","李四"]',
+    '2) 去除序号、班级、学号、括号备注、标点，保留姓名本体',
+    '3) 过滤明显非姓名的词（如“语文/作业/成绩/名单/男/女/缺勤”等）',
+    '4) 不要输出重复姓名',
+    '5) 如果无法确定，请尽量保守，不要编造姓名',
+    '',
+    '原始文本：',
+    inputText,
+  ].join('\n')
+
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.2,
+        topP: 0.9,
+        maxOutputTokens: 1024,
+      },
+    }),
+  })
+
+  if (!res.ok) {
+    let details = ''
+    try {
+      details = JSON.stringify(await res.json())
+    } catch {
+      details = await res.text()
+    }
+    throw new Error(`Gemini API 请求失败：HTTP ${res.status} ${res.statusText}${details ? ` - ${details}` : ''}`)
+  }
+
+  const data = (await res.json()) as GeminiGenerateContentResponse
+  const parts = data.candidates?.[0]?.content?.parts ?? []
+  const text = parts
+    .map((p) => p.text ?? '')
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .join('\n')
+  const jsonArr = extractJsonArrayFromText(text)
+  if (jsonArr) {
+    try {
+      const parsed = JSON.parse(jsonArr) as unknown
+      if (Array.isArray(parsed)) return uniqueNames(parsed.map((x) => String(x)))
+    } catch {
+      // fallthrough to line parsing
+    }
+  }
+
+  // Fallback: parse as newline-separated
+  const fallback = text
+    .split(/\r?\n/g)
+    .map((s: string) => s.trim())
+    .filter(Boolean)
+  return uniqueNames(fallback)
+}
+
 function App() {
   const [date, setDate] = useState(() => safeTodayISO())
   const [homeworkTitle, setHomeworkTitle] = useState('')
@@ -266,6 +397,19 @@ function App() {
   })
 
   const roster = useMemo(() => normalizeRoster(rosterText), [rosterText])
+
+  const [geminiApiKey, setGeminiApiKey] = useState(() => {
+    const envKey = import.meta.env.VITE_GEMINI_API_KEY
+    return envKey || localStorage.getItem('geminiApiKey') || ''
+  })
+  const [rememberGeminiKey, setRememberGeminiKey] = useState(() => Boolean(localStorage.getItem('geminiApiKey')))
+  const [geminiModel, setGeminiModel] = useState(() => localStorage.getItem('geminiModel') || 'gemini-1.5-flash')
+  const [geminiInputText, setGeminiInputText] = useState('')
+  const [geminiMode, setGeminiMode] = useState<GeminiRosterMode>('append')
+  const [geminiPreview, setGeminiPreview] = useState<string[]>([])
+  const [geminiStatus, setGeminiStatus] = useState('')
+  const [geminiLoading, setGeminiLoading] = useState(false)
+  const geminiAbortRef = useRef<AbortController | null>(null)
 
   const [isRecording, setIsRecording] = useState(false)
   const [status, setStatus] = useState<string>('')
@@ -287,9 +431,23 @@ function App() {
   }, [rosterText])
 
   useEffect(() => {
+    localStorage.setItem('geminiModel', geminiModel)
+  }, [geminiModel])
+
+  useEffect(() => {
+    if (!rememberGeminiKey) {
+      localStorage.removeItem('geminiApiKey')
+      return
+    }
+    if (geminiApiKey.trim()) localStorage.setItem('geminiApiKey', geminiApiKey.trim())
+  }, [geminiApiKey, rememberGeminiKey])
+
+  useEffect(() => {
     return () => {
       recognitionRef.current?.abort()
       recognitionRef.current = null
+      geminiAbortRef.current?.abort()
+      geminiAbortRef.current = null
     }
   }, [])
 
@@ -386,6 +544,64 @@ function App() {
 
   const exportNow = () => exportToExcel({ date, homeworkTitle, entries })
 
+  const runGeminiRoster = async () => {
+    setGeminiStatus('')
+    setGeminiPreview([])
+
+    const key = geminiApiKey.trim()
+    if (!key) {
+      setGeminiStatus('请先填写 Gemini API Key（或配置 VITE_GEMINI_API_KEY）。')
+      return
+    }
+    if (!geminiInputText.trim()) {
+      setGeminiStatus('请粘贴原始名单/文本后再生成。')
+      return
+    }
+
+    geminiAbortRef.current?.abort()
+    const ac = new AbortController()
+    geminiAbortRef.current = ac
+
+    setGeminiLoading(true)
+    try {
+      const names = await geminiExtractRosterNames({
+        apiKey: key,
+        model: geminiModel,
+        inputText: geminiInputText,
+        signal: ac.signal,
+      })
+      setGeminiPreview(names)
+      setGeminiStatus(names.length ? `已提取 ${names.length} 个姓名，可应用到花名册。` : '未提取到姓名：请检查输入文本或换一种粘贴格式。')
+    } catch (e) {
+      if (isAbortError(e)) {
+        setGeminiStatus('已取消请求。')
+      } else {
+        setGeminiStatus((e as Error).message || 'Gemini 请求失败。')
+      }
+    } finally {
+      setGeminiLoading(false)
+    }
+  }
+
+  const cancelGemini = () => {
+    geminiAbortRef.current?.abort()
+    geminiAbortRef.current = null
+  }
+
+  const applyGeminiRoster = () => {
+    if (geminiPreview.length === 0) {
+      setGeminiStatus('预览为空：请先生成。')
+      return
+    }
+    const current = normalizeRoster(rosterText)
+    const next =
+      geminiMode === 'replace'
+        ? uniqueNames(geminiPreview)
+        : uniqueNames([...current, ...geminiPreview])
+    setRosterText(next.join('\n'))
+    setGeminiStatus(`已${geminiMode === 'replace' ? '替换' : '追加'}到花名册：当前 ${next.length} 人。`)
+  }
+
   return (
     <div className="app">
       <header className="header">
@@ -465,6 +681,87 @@ function App() {
             placeholder="每行一个姓名，例如：\n张三\n李四\n王五"
           />
           <div className="tiny">当前花名册人数：{roster.length}</div>
+
+          <div className="divider" />
+          <div className="panel-title">Gemini 辅助录入花名册（可选）</div>
+          <div className="panel-subtitle">
+            把原始名单（可含序号/备注/混杂文字）粘贴到下方，Gemini 会尝试提取姓名并生成预览。注意：在纯前端调用会暴露 API Key，建议使用受限 Key 或改为后端代理。
+          </div>
+
+          <div className="ai-grid">
+            <label className="field">
+              <div className="field-label">Gemini API Key</div>
+              <input
+                className="input"
+                type="password"
+                value={geminiApiKey}
+                onChange={(e) => setGeminiApiKey(e.target.value)}
+                placeholder="粘贴你的 API Key（或使用 VITE_GEMINI_API_KEY）"
+                autoComplete="off"
+              />
+            </label>
+            <label className="field">
+              <div className="field-label">模型</div>
+              <input
+                className="input"
+                value={geminiModel}
+                onChange={(e) => setGeminiModel(e.target.value)}
+                placeholder="例如：gemini-1.5-flash"
+              />
+            </label>
+          </div>
+
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={rememberGeminiKey}
+              onChange={(e) => setRememberGeminiKey(e.target.checked)}
+            />
+            <span>记住 API Key（保存到浏览器 localStorage）</span>
+          </label>
+
+          <textarea
+            className="textarea"
+            value={geminiInputText}
+            onChange={(e) => setGeminiInputText(e.target.value)}
+            rows={5}
+            placeholder="粘贴原始名单/文本，例如：\n1. 张三（语文）\n2. 李四\n3. 王五"
+          />
+
+          <div className="ai-actions">
+            <select
+              className="input select"
+              value={geminiMode}
+              onChange={(e) => setGeminiMode(e.target.value as GeminiRosterMode)}
+              aria-label="应用方式"
+            >
+              <option value="append">追加去重</option>
+              <option value="replace">替换花名册</option>
+            </select>
+
+            <button className="btn btn-primary" onClick={runGeminiRoster} disabled={geminiLoading}>
+              {geminiLoading ? '生成中…' : '生成预览'}
+            </button>
+            <button className="btn" onClick={applyGeminiRoster} disabled={geminiLoading || geminiPreview.length === 0}>
+              应用到花名册
+            </button>
+            <button className="btn btn-danger" onClick={cancelGemini} disabled={!geminiLoading}>
+              取消
+            </button>
+          </div>
+
+          {geminiStatus ? <div className={`hint ${geminiStatus.includes('失败') ? 'danger' : ''}`}>{geminiStatus}</div> : null}
+
+          {geminiPreview.length ? (
+            <div className="preview roster-preview">
+              {geminiPreview.map((n) => (
+                <div key={n} className="preview-row">
+                  <div className="preview-name">{n}</div>
+                  <div className="preview-score">{/* spacer */}</div>
+                </div>
+              ))}
+            </div>
+          ) : null}
         </section>
 
         <section className="grid2">

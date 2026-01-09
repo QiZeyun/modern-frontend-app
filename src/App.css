@@ -313,6 +313,51 @@
   color: rgba(15, 23, 42, 0.55);
 }
 
+.divider {
+  margin: 14px 0;
+  height: 1px;
+  background: rgba(15, 23, 42, 0.08);
+}
+
+.ai-grid {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.ai-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.select {
+  width: auto;
+  min-width: 160px;
+  padding-right: 34px;
+}
+
+.check {
+  margin-top: 10px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  font-size: 12px;
+  color: rgba(15, 23, 42, 0.72);
+}
+
+.check input {
+  width: 16px;
+  height: 16px;
+}
+
+.roster-preview .preview-row {
+  grid-template-columns: 1fr 0px;
+}
+
 .footer {
   max-width: 1100px;
   margin: 0 auto;
@@ -325,6 +370,9 @@
     grid-template-columns: 1fr;
   }
   .grid2 {
+    grid-template-columns: 1fr;
+  }
+  .ai-grid {
     grid-template-columns: 1fr;
   }
   .table-head,
