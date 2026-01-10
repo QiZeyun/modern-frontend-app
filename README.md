@@ -100,6 +100,21 @@ pnpm type-check
 
 项目已配置 Vercel 部署，可以通过以下方式部署：
 
+#### 方式零：GitHub Actions 自动部署（可选）
+
+本仓库的 CI 已包含一个 **Vercel Deploy** job：
+
+- **PR**：自动部署 **Preview**，并在 PR 评论里贴出预览链接
+- **push 到 `main`**：自动部署 **Production**
+
+要启用它，请在 GitHub 仓库的 **Settings → Secrets and variables → Actions** 添加：
+
+- `VERCEL_TOKEN`
+- `VERCEL_ORG_ID`
+- `VERCEL_PROJECT_ID`
+
+> 未配置以上 secrets 时，部署步骤会自动跳过，不影响 CI 通过。
+
 #### 方式一：通过 Vercel CLI（推荐）
 
 1. 安装 Vercel CLI：

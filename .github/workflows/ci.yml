@@ -47,3 +47,37 @@ jobs:
         name: dist-${{ matrix.node-version }}
         path: dist
         retention-days: 7
+
+  vercel_deploy:
+    name: Vercel Deploy (Preview/Production)
+    runs-on: ubuntu-latest
+    needs: build
+    if: >
+      (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+      && secrets.VERCEL_TOKEN != ''
+      && secrets.VERCEL_ORG_ID != ''
+      && secrets.VERCEL_PROJECT_ID != ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy Preview to Vercel
+        if: github.event_name == 'pull_request'
+        uses: amondnet/vercel-action@v25
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          comment-on-pr: true
+
+      - name: Deploy Production to Vercel
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: amondnet/vercel-action@v25
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
