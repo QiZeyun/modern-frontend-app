@@ -42,6 +42,12 @@ type GeminiModelInfo = {
 }
 
 const GEMINI_CUSTOM_MODEL = '__custom__'
+const GEMINI_MANUAL_PRESETS = [
+  'gemini-1.5-flash',
+  'gemini-1.5-flash-latest',
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
+] as const
 
 function isAbortError(e: unknown) {
   return e instanceof DOMException && e.name === 'AbortError'
@@ -835,18 +841,24 @@ function App() {
         .filter((m) => (m.supportedGenerationMethods ?? []).includes('generateContent'))
         .sort((a, b) => geminiModelDisplayName(a.name).localeCompare(geminiModelDisplayName(b.name), 'en'))
       setGeminiModels(usable)
-      setGeminiModelsStatus(usable.length ? `已加载 ${usable.length} 个可用模型。` : '未找到支持 generateContent 的模型。')
+      const manualOk = new Set<string>(GEMINI_MANUAL_PRESETS as unknown as string[])
+      const chosen = geminiModelChoice.trim()
+      const chosenSupported =
+        chosen === GEMINI_CUSTOM_MODEL
+          ? true
+          : usable.some((m) => geminiModelDisplayName(m.name) === chosen) || manualOk.has(chosen)
+      setGeminiModelsStatus(
+        usable.length
+          ? `已加载 ${usable.length} 个可用模型。${chosenSupported ? '' : '（当前选择的模型可能不受此 Key 支持）'}`
+          : '未找到支持 generateContent 的模型。',
+      )
       if (usable.length) {
+        // Do NOT auto-switch away from manual presets (e.g. gemini-1.5-flash).
         const currentChoice = geminiModelChoice.trim()
-        const currentFull =
-          currentChoice === GEMINI_CUSTOM_MODEL
-            ? `models/${geminiModelCustom.trim()}`
-            : `models/${currentChoice}`
-        const exists = usable.some(
-          (m) => m.name === currentFull || geminiModelDisplayName(m.name) === currentChoice,
-        )
-        if (!exists && geminiModelChoice !== GEMINI_CUSTOM_MODEL) {
-          setGeminiModelChoice(geminiModelDisplayName(usable[0].name))
+        const manualOk2 = new Set<string>(GEMINI_MANUAL_PRESETS as unknown as string[])
+        if (currentChoice !== GEMINI_CUSTOM_MODEL && !manualOk2.has(currentChoice)) {
+          const exists = usable.some((m) => geminiModelDisplayName(m.name) === currentChoice)
+          if (!exists) setGeminiModelChoice(geminiModelDisplayName(usable[0].name))
         }
       }
     } catch (e) {
@@ -855,7 +867,7 @@ function App() {
     } finally {
       setGeminiModelsLoading(false)
     }
-  }, [geminiApiKey, geminiModelChoice, geminiModelCustom])
+  }, [geminiApiKey, geminiModelChoice])
 
   // Best-effort auto refresh when key changes
   useEffect(() => {
@@ -1457,20 +1469,22 @@ function App() {
                 onChange={(e) => setGeminiModelChoice(e.target.value)}
                 aria-label="Gemini 模型选择"
               >
+                <optgroup label="常用预设（可手动选择）">
+                  <option value="gemini-1.5-flash">gemini-1.5-flash</option>
+                  <option value="gemini-1.5-flash-latest">gemini-1.5-flash-latest</option>
+                  <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+                  <option value="gemini-2.0-flash-lite">gemini-2.0-flash-lite</option>
+                </optgroup>
                 {geminiModels.length ? (
-                  geminiModels.map((m) => (
-                    <option key={m.name} value={geminiModelDisplayName(m.name)}>
-                      {geminiModelDisplayName(m.name)}
-                      {m.displayName ? `（${m.displayName}）` : ''}
-                    </option>
-                  ))
-                ) : (
-                  <>
-                    <option value="gemini-2.0-flash">gemini-2.0-flash</option>
-                    <option value="gemini-2.0-flash-lite">gemini-2.0-flash-lite</option>
-                    <option value="gemini-1.5-flash-latest">gemini-1.5-flash-latest</option>
-                  </>
-                )}
+                  <optgroup label="当前 Key 可用模型（generateContent）">
+                    {geminiModels.map((m) => (
+                      <option key={m.name} value={geminiModelDisplayName(m.name)}>
+                        {geminiModelDisplayName(m.name)}
+                        {m.displayName ? `（${m.displayName}）` : ''}
+                      </option>
+                    ))}
+                  </optgroup>
+                ) : null}
                 <option value={GEMINI_CUSTOM_MODEL}>自定义…</option>
               </select>
             </label>
