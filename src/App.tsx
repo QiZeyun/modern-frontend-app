@@ -49,6 +49,11 @@ const GEMINI_MANUAL_PRESETS = [
   'gemini-2.0-flash-lite',
 ] as const
 
+type AiProvider = 'gemini' | 'qwen'
+
+const QWEN_CUSTOM_MODEL = '__custom__'
+const QWEN_MANUAL_PRESETS = ['qwen-turbo', 'qwen-plus', 'qwen-max', 'qwen-long'] as const
+
 function isAbortError(e: unknown) {
   return e instanceof DOMException && e.name === 'AbortError'
 }
@@ -86,6 +91,71 @@ async function geminiListModels(params: {
   }
   const data = (await res.json()) as { models?: GeminiModelInfo[] }
   return data.models ?? []
+}
+
+type QwenGenerateResponse = {
+  output?: {
+    text?: string
+    choices?: Array<{
+      message?: {
+        role?: string
+        content?: string
+      }
+      text?: string
+    }>
+  }
+  message?: string
+}
+
+async function qwenGenerateText(params: {
+  apiKey: string
+  model: string
+  prompt: string
+  signal?: AbortSignal
+  temperature?: number
+  maxTokens?: number
+}): Promise<string> {
+  const { apiKey, model, prompt, signal, temperature = 0.2, maxTokens = 1024 } = params
+  // DashScope Qwen text-generation (may require backend proxy due to CORS).
+  const endpoint = 'https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation'
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    signal,
+    body: JSON.stringify({
+      model,
+      input: {
+        // result_format: message -> output.choices[0].message.content in some responses
+        prompt,
+      },
+      parameters: {
+        temperature,
+        max_tokens: maxTokens,
+        result_format: 'message',
+      },
+    }),
+  })
+
+  if (!res.ok) {
+    let details = ''
+    try {
+      details = JSON.stringify(await res.json())
+    } catch {
+      details = await res.text()
+    }
+    throw new Error(`千问 API 请求失败：HTTP ${res.status} ${res.statusText}${details ? ` - ${details}` : ''}`)
+  }
+
+  const data = (await res.json()) as QwenGenerateResponse
+  const content =
+    data.output?.choices?.[0]?.message?.content ??
+    data.output?.choices?.[0]?.text ??
+    data.output?.text ??
+    ''
+  return String(content || '').trim()
 }
 
 function rosterItemsToText(items: RosterItem[]) {
@@ -540,6 +610,78 @@ async function geminiParseHomeworkScores(params: {
   return Array.from(byKey.values())
 }
 
+async function aiParseHomeworkScores(params: {
+  provider: AiProvider
+  apiKey: string
+  model: string
+  transcript: string
+  roster: RosterItem[]
+  signal?: AbortSignal
+}): Promise<Array<{ studentId: string; name: string; score: number }>> {
+  const { provider, apiKey, model, transcript, roster, signal } = params
+  if (provider === 'gemini') {
+    return await geminiParseHomeworkScores({ apiKey, model, transcript, roster, signal })
+  }
+
+  const prompt = [
+    '你是语文老师的“作业成绩语音录入助手”。',
+    '给你两份输入：1) 花名册（包含学号 studentId 与姓名 name）2) 老师口述成绩的识别文本。',
+    '任务：从识别文本中提取每个学生的成绩，并把“学号或姓名”映射为花名册中的学生。',
+    '',
+    '强约束：',
+    '1) 只输出 JSON 数组，不要任何额外文字',
+    '2) 数组元素是对象：{"studentId":"<花名册里的studentId，可为空字符串>","name":"<花名册里的name>","score":<0-100整数>}',
+    '3) name 必须严格来自花名册；studentId 必须与该 name 对应（若花名册中该学生学号为空，则 studentId 也输出空字符串）',
+    '4) 允许老师用“学号”或“姓名”报分；但输出必须是花名册中的标准记录',
+    '5) 同一学生出现多次取“最后一次”成绩',
+    '',
+    '花名册：',
+    JSON.stringify(roster),
+    '',
+    '识别文本：',
+    transcript,
+  ].join('\n')
+
+  const text = await qwenGenerateText({ apiKey, model, prompt, signal, temperature: 0.1, maxTokens: 1024 })
+  const jsonArr = extractJsonArrayFromText(text)
+  if (!jsonArr) return []
+
+  const parsed = JSON.parse(jsonArr) as unknown
+  if (!Array.isArray(parsed)) return []
+
+  // Reuse the same strict validation as Gemini path:
+  const rosterByName = new Map<string, RosterItem>()
+  const rosterById = new Map<string, RosterItem>()
+  for (const r of roster) {
+    if (r.name) rosterByName.set(r.name, r)
+    if (r.studentId) rosterById.set(r.studentId, r)
+  }
+  const byKey = new Map<string, { studentId: string; name: string; score: number }>()
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') continue
+    const name = normalizeStudentName(String((item as { name?: unknown }).name ?? ''))
+    const studentId = normalizeStudentId(String((item as { studentId?: unknown }).studentId ?? ''))
+    const scoreRaw = (item as { score?: unknown }).score
+    const scoreNum = typeof scoreRaw === 'number' ? scoreRaw : Number(scoreRaw)
+    if (!name) continue
+    if (!Number.isFinite(scoreNum)) continue
+    const s = clampScore(Math.round(scoreNum))
+    if (s === null) continue
+
+    const matchedById = studentId ? rosterById.get(studentId) : undefined
+    const matchedByName = rosterByName.get(name)
+    const matched = matchedById ?? matchedByName
+    if (!matched) continue
+    if (matched.name !== name) continue
+    if (matched.studentId && matched.studentId !== studentId) continue
+
+    const outId = matched.studentId || ''
+    const key = outId ? `id:${outId}` : `name:${matched.name}`
+    byKey.set(key, { studentId: outId, name: matched.name, score: s })
+  }
+  return Array.from(byKey.values())
+}
+
 async function geminiExtractRosterNamesWithExclusions(params: {
   apiKey: string
   model: string
@@ -617,74 +759,43 @@ async function geminiExtractRosterNamesWithExclusions(params: {
   return uniqueNames(fallback)
 }
 
-async function geminiExtractRosterNames(params: {
+async function aiExtractRosterNamesWithExclusions(params: {
+  provider: AiProvider
   apiKey: string
   model: string
   inputText: string
+  existingNames: string[]
   signal?: AbortSignal
 }): Promise<string[]> {
-  const { apiKey, model, inputText, signal } = params
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    normalizeGeminiModelSegment(model),
-  )}:generateContent?key=${encodeURIComponent(apiKey)}`
-
+  const { provider, apiKey, model, inputText, existingNames, signal } = params
+  if (provider === 'gemini') {
+    return await geminiExtractRosterNamesWithExclusions({ apiKey, model, inputText, existingNames, signal })
+  }
   const prompt = [
     '你是一个帮助语文老师整理“花名册”的助手。',
     '任务：从用户提供的原始文本中提取学生姓名，输出 JSON 数组（只输出 JSON，不要多余文字）。',
     '',
-    '规则：',
+    '强约束：',
     '1) 只输出 JSON 数组，例如：["张三","李四"]',
     '2) 去除序号、班级、学号、括号备注、标点，保留姓名本体',
     '3) 过滤明显非姓名的词（如“语文/作业/成绩/名单/男/女/缺勤”等）',
     '4) 不要输出重复姓名',
-    '5) 如果无法确定，请尽量保守，不要编造姓名',
+    `5) 不要输出已存在的姓名（已有名单）：${JSON.stringify(existingNames)}`,
+    '6) 如果无法确定，请保守处理，不要编造姓名',
     '',
     '原始文本：',
     inputText,
   ].join('\n')
-
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal,
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.2,
-        topP: 0.9,
-        maxOutputTokens: 1024,
-      },
-    }),
-  })
-
-  if (!res.ok) {
-    let details = ''
-    try {
-      details = JSON.stringify(await res.json())
-    } catch {
-      details = await res.text()
-    }
-    throw new Error(`Gemini API 请求失败：HTTP ${res.status} ${res.statusText}${details ? ` - ${details}` : ''}`)
-  }
-
-  const data = (await res.json()) as GeminiGenerateContentResponse
-  const parts = data.candidates?.[0]?.content?.parts ?? []
-  const text = parts
-    .map((p) => p.text ?? '')
-    .map((t) => t.trim())
-    .filter(Boolean)
-    .join('\n')
+  const text = await qwenGenerateText({ apiKey, model, prompt, signal, temperature: 0.2, maxTokens: 1024 })
   const jsonArr = extractJsonArrayFromText(text)
   if (jsonArr) {
     try {
       const parsed = JSON.parse(jsonArr) as unknown
       if (Array.isArray(parsed)) return uniqueNames(parsed.map((x) => String(x)))
     } catch {
-      // fallthrough to line parsing
+      // fallthrough
     }
   }
-
-  // Fallback: parse as newline-separated
   const fallback = text
     .split(/\r?\n/g)
     .map((s: string) => s.trim())
@@ -717,11 +828,23 @@ function App() {
     return m
   }, [roster])
 
+  const [aiProvider, setAiProvider] = useState<AiProvider>(() => {
+    const saved = localStorage.getItem('aiProvider') as AiProvider | null
+    return saved || 'gemini'
+  })
+
   const [geminiApiKey, setGeminiApiKey] = useState(() => {
     const envKey = import.meta.env.VITE_GEMINI_API_KEY
     return envKey || localStorage.getItem('geminiApiKey') || ''
   })
-  const [rememberGeminiKey, setRememberGeminiKey] = useState(() => Boolean(localStorage.getItem('geminiApiKey')))
+  const [qwenApiKey, setQwenApiKey] = useState(() => {
+    const envKey = import.meta.env.VITE_QWEN_API_KEY
+    return envKey || localStorage.getItem('qwenApiKey') || ''
+  })
+
+  const [rememberAiKey, setRememberAiKey] = useState(() => {
+    return Boolean(localStorage.getItem('geminiApiKey') || localStorage.getItem('qwenApiKey'))
+  })
   const [geminiModels, setGeminiModels] = useState<GeminiModelInfo[]>([])
   const [geminiModelsLoading, setGeminiModelsLoading] = useState(false)
   const [geminiModelsStatus, setGeminiModelsStatus] = useState('')
@@ -741,6 +864,13 @@ function App() {
   const [geminiModelCustom, setGeminiModelCustom] = useState(() => localStorage.getItem('geminiModelCustom') || '')
   const geminiModel =
     geminiModelChoice === GEMINI_CUSTOM_MODEL ? geminiModelCustom.trim() : geminiModelChoice.trim()
+
+  const [qwenModelChoice, setQwenModelChoice] = useState(() => localStorage.getItem('qwenModelChoice') || 'qwen-plus')
+  const [qwenModelCustom, setQwenModelCustom] = useState(() => localStorage.getItem('qwenModelCustom') || '')
+  const qwenModel = qwenModelChoice === QWEN_CUSTOM_MODEL ? qwenModelCustom.trim() : qwenModelChoice.trim()
+
+  const aiApiKey = aiProvider === 'gemini' ? geminiApiKey.trim() : qwenApiKey.trim()
+  const aiModel = aiProvider === 'gemini' ? geminiModel : qwenModel
   const [geminiInputText, setGeminiInputText] = useState('')
   const [geminiMode, setGeminiMode] = useState<GeminiRosterMode>('append')
   const [geminiPreview, setGeminiPreview] = useState<string[]>([])
@@ -772,6 +902,9 @@ function App() {
   const rosterVoiceAutoApplyRef = useRef(rosterVoiceAutoApply)
   const geminiKeyRef = useRef(geminiApiKey)
   const geminiModelRef = useRef(geminiModel)
+  const qwenKeyRef = useRef(qwenApiKey)
+  const qwenModelRef = useRef(qwenModel)
+  const aiProviderRef = useRef<AiProvider>(aiProvider)
 
   const [isRecording, setIsRecording] = useState(false)
   const [status, setStatus] = useState<string>('')
@@ -805,6 +938,11 @@ function App() {
   }, [rosterVoiceAutoApply])
 
   useEffect(() => {
+    localStorage.setItem('aiProvider', aiProvider)
+    aiProviderRef.current = aiProvider
+  }, [aiProvider])
+
+  useEffect(() => {
     geminiKeyRef.current = geminiApiKey
   }, [geminiApiKey])
 
@@ -813,12 +951,28 @@ function App() {
   }, [geminiModel])
 
   useEffect(() => {
+    qwenKeyRef.current = qwenApiKey
+  }, [qwenApiKey])
+
+  useEffect(() => {
+    qwenModelRef.current = qwenModel
+  }, [qwenModel])
+
+  useEffect(() => {
     localStorage.setItem('geminiModelChoice', geminiModelChoice)
   }, [geminiModelChoice])
 
   useEffect(() => {
     localStorage.setItem('geminiModelCustom', geminiModelCustom)
   }, [geminiModelCustom])
+
+  useEffect(() => {
+    localStorage.setItem('qwenModelChoice', qwenModelChoice)
+  }, [qwenModelChoice])
+
+  useEffect(() => {
+    localStorage.setItem('qwenModelCustom', qwenModelCustom)
+  }, [qwenModelCustom])
 
   useEffect(() => {
     localStorage.setItem('useGeminiForMatching', useGeminiForMatching ? '1' : '0')
@@ -876,12 +1030,14 @@ function App() {
   }, [geminiApiKey, refreshGeminiModels])
 
   useEffect(() => {
-    if (!rememberGeminiKey) {
+    if (!rememberAiKey) {
       localStorage.removeItem('geminiApiKey')
+      localStorage.removeItem('qwenApiKey')
       return
     }
     if (geminiApiKey.trim()) localStorage.setItem('geminiApiKey', geminiApiKey.trim())
-  }, [geminiApiKey, rememberGeminiKey])
+    if (qwenApiKey.trim()) localStorage.setItem('qwenApiKey', qwenApiKey.trim())
+  }, [geminiApiKey, qwenApiKey, rememberAiKey])
 
   useEffect(() => {
     return () => {
@@ -1000,14 +1156,15 @@ function App() {
 
   const runRosterAiExtractNow = useCallback(async (text: string) => {
     setRosterVoiceStatus('')
-    const key = geminiKeyRef.current.trim()
+    const provider = aiProviderRef.current
+    const key = provider === 'gemini' ? geminiKeyRef.current.trim() : qwenKeyRef.current.trim()
     if (!key) {
-      setRosterVoiceStatus('请先填写 Gemini API Key（用于 AI 实时提取姓名）。')
+      setRosterVoiceStatus('请先填写 AI API Key（用于 AI 实时提取姓名）。')
       return
     }
-    const model = geminiModelRef.current
+    const model = provider === 'gemini' ? geminiModelRef.current : qwenModelRef.current
     if (!model) {
-      setRosterVoiceStatus('请先选择 Gemini 模型。')
+      setRosterVoiceStatus('请先选择 AI 模型。')
       return
     }
     if (!text.trim()) return
@@ -1028,7 +1185,8 @@ function App() {
         ...normalizeRoster(rosterTextRef.current).map((r) => r.name),
         ...rosterVoiceNewNamesRef.current,
       ])
-      const names = await geminiExtractRosterNamesWithExclusions({
+      const names = await aiExtractRosterNamesWithExclusions({
+        provider,
         apiKey: key,
         model,
         inputText: text,
@@ -1120,18 +1278,18 @@ function App() {
     const transcript = (finalText + ' ' + interimText).trim()
     if (!transcript) return
 
-    const key = geminiApiKey.trim()
-    const canUseGemini = Boolean(useGeminiForMatching && key && geminiModel && roster.length > 0)
+    const canUseAi = Boolean(useGeminiForMatching && aiApiKey && aiModel && roster.length > 0)
 
-    if (canUseGemini) {
+    if (canUseAi) {
       geminiAbortRef.current?.abort()
       const ac = new AbortController()
       geminiAbortRef.current = ac
       setGeminiMatchLoading(true)
       try {
-        const pairs = await geminiParseHomeworkScores({
-          apiKey: key,
-          model: geminiModel,
+        const pairs = await aiParseHomeworkScores({
+          provider: aiProvider,
+          apiKey: aiApiKey,
+          model: aiModel,
           transcript,
           roster,
           signal: ac.signal,
@@ -1227,9 +1385,9 @@ function App() {
     setGeminiStatus('')
     setGeminiPreview([])
 
-    const key = geminiApiKey.trim()
+    const key = aiApiKey
     if (!key) {
-      setGeminiStatus('请先填写 Gemini API Key（或配置 VITE_GEMINI_API_KEY）。')
+      setGeminiStatus('请先填写 AI API Key。')
       return
     }
     if (!geminiInputText.trim()) {
@@ -1243,10 +1401,12 @@ function App() {
 
     setGeminiLoading(true)
     try {
-      const names = await geminiExtractRosterNames({
+      const names = await aiExtractRosterNamesWithExclusions({
+        provider: aiProvider,
         apiKey: key,
-        model: geminiModel,
+        model: aiModel,
         inputText: geminiInputText,
+        existingNames: uniqueNames(normalizeRoster(rosterText).map((r) => r.name)),
         signal: ac.signal,
       })
       setGeminiPreview(names)
@@ -1255,7 +1415,7 @@ function App() {
       if (isAbortError(e)) {
         setGeminiStatus('已取消请求。')
       } else {
-        const msg = (e as Error).message || 'Gemini 请求失败。'
+        const msg = (e as Error).message || 'AI 请求失败。'
         setGeminiStatus(
           msg.includes('models/') && msg.includes('not found')
             ? `${msg}（请点击“刷新模型列表”，选择当前 Key 支持的模型）`
@@ -1444,60 +1604,92 @@ function App() {
           </div>
 
           <div className="divider" />
-          <div className="panel-title">Gemini 辅助录入花名册（可选）</div>
+          <div className="panel-title">AI 辅助录入（可选）</div>
           <div className="panel-subtitle">
-            把原始名单（可含序号/备注/混杂文字）粘贴到下方，Gemini 会尝试提取姓名并生成预览。注意：在纯前端调用会暴露 API Key，建议使用受限 Key 或改为后端代理。
+            把原始名单（可含序号/备注/混杂文字）粘贴到下方，AI 会尝试提取姓名并生成预览。注意：纯前端直连会暴露 Key，且“千问”在部分环境可能存在 CORS 限制，生产建议改为后端代理。
           </div>
 
           <div className="ai-grid">
             <label className="field">
-              <div className="field-label">Gemini API Key</div>
+              <div className="field-label">AI 提供方</div>
+              <select className="input select" value={aiProvider} onChange={(e) => setAiProvider(e.target.value as AiProvider)}>
+                <option value="gemini">Gemini</option>
+                <option value="qwen">通义千问（Qwen）</option>
+              </select>
+            </label>
+            <label className="field">
+              <div className="field-label">API Key</div>
               <input
                 className="input"
                 type="password"
-                value={geminiApiKey}
-                onChange={(e) => setGeminiApiKey(e.target.value)}
-                placeholder="粘贴你的 API Key（或使用 VITE_GEMINI_API_KEY）"
+                value={aiProvider === 'gemini' ? geminiApiKey : qwenApiKey}
+                onChange={(e) => (aiProvider === 'gemini' ? setGeminiApiKey(e.target.value) : setQwenApiKey(e.target.value))}
+                placeholder={aiProvider === 'gemini' ? 'Gemini Key（或 VITE_GEMINI_API_KEY）' : 'DashScope Key（或 VITE_QWEN_API_KEY）'}
                 autoComplete="off"
               />
             </label>
             <label className="field">
               <div className="field-label">模型</div>
-              <select
-                className="input select"
-                value={geminiModelChoice}
-                onChange={(e) => setGeminiModelChoice(e.target.value)}
-                aria-label="Gemini 模型选择"
-              >
-                <optgroup label="常用预设（可手动选择）">
-                  <option value="gemini-1.5-flash">gemini-1.5-flash</option>
-                  <option value="gemini-1.5-flash-latest">gemini-1.5-flash-latest</option>
-                  <option value="gemini-2.0-flash">gemini-2.0-flash</option>
-                  <option value="gemini-2.0-flash-lite">gemini-2.0-flash-lite</option>
-                </optgroup>
-                {geminiModels.length ? (
-                  <optgroup label="当前 Key 可用模型（generateContent）">
-                    {geminiModels.map((m) => (
-                      <option key={m.name} value={geminiModelDisplayName(m.name)}>
-                        {geminiModelDisplayName(m.name)}
-                        {m.displayName ? `（${m.displayName}）` : ''}
+              {aiProvider === 'gemini' ? (
+                <select
+                  className="input select"
+                  value={geminiModelChoice}
+                  onChange={(e) => setGeminiModelChoice(e.target.value)}
+                  aria-label="Gemini 模型选择"
+                >
+                  <optgroup label="常用预设（可手动选择）">
+                    {GEMINI_MANUAL_PRESETS.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
                       </option>
                     ))}
                   </optgroup>
-                ) : null}
-                <option value={GEMINI_CUSTOM_MODEL}>自定义…</option>
-              </select>
+                  {geminiModels.length ? (
+                    <optgroup label="当前 Key 可用模型（generateContent）">
+                      {geminiModels.map((m) => (
+                        <option key={m.name} value={geminiModelDisplayName(m.name)}>
+                          {geminiModelDisplayName(m.name)}
+                          {m.displayName ? `（${m.displayName}）` : ''}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ) : null}
+                  <option value={GEMINI_CUSTOM_MODEL}>自定义…</option>
+                </select>
+              ) : (
+                <select
+                  className="input select"
+                  value={qwenModelChoice}
+                  onChange={(e) => setQwenModelChoice(e.target.value)}
+                  aria-label="千问 模型选择"
+                >
+                  <optgroup label="常用预设">
+                    {QWEN_MANUAL_PRESETS.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </optgroup>
+                  <option value={QWEN_CUSTOM_MODEL}>自定义…</option>
+                </select>
+              )}
             </label>
           </div>
 
           <div className="ai-actions">
-            <button className="btn" onClick={() => void refreshGeminiModels()} disabled={geminiModelsLoading || !geminiApiKey.trim()}>
-              {geminiModelsLoading ? '刷新中…' : '刷新模型列表'}
-            </button>
-            {geminiModelsStatus ? <div className="tiny">{geminiModelsStatus}</div> : null}
+            {aiProvider === 'gemini' ? (
+              <>
+                <button className="btn" onClick={() => void refreshGeminiModels()} disabled={geminiModelsLoading || !geminiApiKey.trim()}>
+                  {geminiModelsLoading ? '刷新中…' : '刷新模型列表'}
+                </button>
+                {geminiModelsStatus ? <div className="tiny">{geminiModelsStatus}</div> : null}
+              </>
+            ) : (
+              <div className="tiny">提示：千问（DashScope）未提供同等的前端可用“列模型”接口，这里使用常用预设 + 自定义。</div>
+            )}
           </div>
 
-          {geminiModelChoice === GEMINI_CUSTOM_MODEL ? (
+          {aiProvider === 'gemini' && geminiModelChoice === GEMINI_CUSTOM_MODEL ? (
             <label className="field">
               <div className="field-label">自定义模型名称</div>
               <input
@@ -1509,11 +1701,23 @@ function App() {
             </label>
           ) : null}
 
+          {aiProvider === 'qwen' && qwenModelChoice === QWEN_CUSTOM_MODEL ? (
+            <label className="field">
+              <div className="field-label">自定义模型名称</div>
+              <input
+                className="input"
+                value={qwenModelCustom}
+                onChange={(e) => setQwenModelCustom(e.target.value)}
+                placeholder="例如：qwen-plus"
+              />
+            </label>
+          ) : null}
+
           <label className="check">
             <input
               type="checkbox"
-              checked={rememberGeminiKey}
-              onChange={(e) => setRememberGeminiKey(e.target.checked)}
+              checked={rememberAiKey}
+              onChange={(e) => setRememberAiKey(e.target.checked)}
             />
             <span>记住 API Key（保存到浏览器 localStorage）</span>
           </label>
