@@ -34,7 +34,14 @@ type GeminiGenerateContentResponse = {
   }>
 }
 
-type GeminiModelPreset = 'gemini-1.5-flash' | 'gemini-1.5-pro' | 'gemini-2.0-flash' | 'gemini-2.0-flash-lite' | 'custom'
+type GeminiModelInfo = {
+  name: string // e.g. "models/gemini-2.0-flash"
+  displayName?: string
+  description?: string
+  supportedGenerationMethods?: string[]
+}
+
+const GEMINI_CUSTOM_MODEL = '__custom__'
 
 function isAbortError(e: unknown) {
   return e instanceof DOMException && e.name === 'AbortError'
@@ -43,6 +50,36 @@ function isAbortError(e: unknown) {
 type RosterItem = {
   studentId: string
   name: string
+}
+
+function normalizeGeminiModelSegment(model: string) {
+  const m = model.trim()
+  if (!m) return ''
+  return m.startsWith('models/') ? m.slice('models/'.length) : m
+}
+
+function geminiModelDisplayName(modelName: string) {
+  return modelName.replace(/^models\//, '')
+}
+
+async function geminiListModels(params: {
+  apiKey: string
+  signal?: AbortSignal
+}): Promise<GeminiModelInfo[]> {
+  const { apiKey, signal } = params
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`
+  const res = await fetch(endpoint, { signal })
+  if (!res.ok) {
+    let details = ''
+    try {
+      details = JSON.stringify(await res.json())
+    } catch {
+      details = await res.text()
+    }
+    throw new Error(`获取 Gemini 模型列表失败：HTTP ${res.status} ${res.statusText}${details ? ` - ${details}` : ''}`)
+  }
+  const data = (await res.json()) as { models?: GeminiModelInfo[] }
+  return data.models ?? []
 }
 
 function rosterItemsToText(items: RosterItem[]) {
@@ -400,7 +437,7 @@ async function geminiParseHomeworkScores(params: {
 }): Promise<Array<{ studentId: string; name: string; score: number }>> {
   const { apiKey, model, transcript, roster, signal } = params
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model,
+    normalizeGeminiModelSegment(model),
   )}:generateContent?key=${encodeURIComponent(apiKey)}`
 
   const prompt = [
@@ -506,7 +543,7 @@ async function geminiExtractRosterNamesWithExclusions(params: {
 }): Promise<string[]> {
   const { apiKey, model, inputText, existingNames, signal } = params
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model,
+    normalizeGeminiModelSegment(model),
   )}:generateContent?key=${encodeURIComponent(apiKey)}`
 
   const prompt = [
@@ -582,7 +619,7 @@ async function geminiExtractRosterNames(params: {
 }): Promise<string[]> {
   const { apiKey, model, inputText, signal } = params
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model,
+    normalizeGeminiModelSegment(model),
   )}:generateContent?key=${encodeURIComponent(apiKey)}`
 
   const prompt = [
@@ -679,12 +716,25 @@ function App() {
     return envKey || localStorage.getItem('geminiApiKey') || ''
   })
   const [rememberGeminiKey, setRememberGeminiKey] = useState(() => Boolean(localStorage.getItem('geminiApiKey')))
-  const [geminiModelPreset, setGeminiModelPreset] = useState<GeminiModelPreset>(() => {
-    const saved = localStorage.getItem('geminiModelPreset') as GeminiModelPreset | null
-    return saved || 'gemini-1.5-flash'
+  const [geminiModels, setGeminiModels] = useState<GeminiModelInfo[]>([])
+  const [geminiModelsLoading, setGeminiModelsLoading] = useState(false)
+  const [geminiModelsStatus, setGeminiModelsStatus] = useState('')
+  const geminiModelsAbortRef = useRef<AbortController | null>(null)
+
+  const [geminiModelChoice, setGeminiModelChoice] = useState(() => {
+    const savedChoice = localStorage.getItem('geminiModelChoice')
+    if (savedChoice) return savedChoice
+    // backward compat with old keys:
+    const oldPreset = localStorage.getItem('geminiModelPreset')
+    const oldCustom = localStorage.getItem('geminiModelCustom') || ''
+    if (oldPreset === 'custom') return GEMINI_CUSTOM_MODEL
+    if (oldPreset) return oldPreset
+    if (oldCustom) return GEMINI_CUSTOM_MODEL
+    return 'gemini-2.0-flash'
   })
   const [geminiModelCustom, setGeminiModelCustom] = useState(() => localStorage.getItem('geminiModelCustom') || '')
-  const geminiModel = geminiModelPreset === 'custom' ? geminiModelCustom.trim() : geminiModelPreset
+  const geminiModel =
+    geminiModelChoice === GEMINI_CUSTOM_MODEL ? geminiModelCustom.trim() : geminiModelChoice.trim()
   const [geminiInputText, setGeminiInputText] = useState('')
   const [geminiMode, setGeminiMode] = useState<GeminiRosterMode>('append')
   const [geminiPreview, setGeminiPreview] = useState<string[]>([])
@@ -757,8 +807,8 @@ function App() {
   }, [geminiModel])
 
   useEffect(() => {
-    localStorage.setItem('geminiModelPreset', geminiModelPreset)
-  }, [geminiModelPreset])
+    localStorage.setItem('geminiModelChoice', geminiModelChoice)
+  }, [geminiModelChoice])
 
   useEffect(() => {
     localStorage.setItem('geminiModelCustom', geminiModelCustom)
@@ -767,6 +817,51 @@ function App() {
   useEffect(() => {
     localStorage.setItem('useGeminiForMatching', useGeminiForMatching ? '1' : '0')
   }, [useGeminiForMatching])
+
+  const refreshGeminiModels = useCallback(async () => {
+    setGeminiModelsStatus('')
+    const key = geminiApiKey.trim()
+    if (!key) {
+      setGeminiModelsStatus('请先填写 Gemini API Key 后再获取模型列表。')
+      return
+    }
+    geminiModelsAbortRef.current?.abort()
+    const ac = new AbortController()
+    geminiModelsAbortRef.current = ac
+    setGeminiModelsLoading(true)
+    try {
+      const models = await geminiListModels({ apiKey: key, signal: ac.signal })
+      const usable = models
+        .filter((m) => (m.supportedGenerationMethods ?? []).includes('generateContent'))
+        .sort((a, b) => geminiModelDisplayName(a.name).localeCompare(geminiModelDisplayName(b.name), 'en'))
+      setGeminiModels(usable)
+      setGeminiModelsStatus(usable.length ? `已加载 ${usable.length} 个可用模型。` : '未找到支持 generateContent 的模型。')
+      if (usable.length) {
+        const currentChoice = geminiModelChoice.trim()
+        const currentFull =
+          currentChoice === GEMINI_CUSTOM_MODEL
+            ? `models/${geminiModelCustom.trim()}`
+            : `models/${currentChoice}`
+        const exists = usable.some(
+          (m) => m.name === currentFull || geminiModelDisplayName(m.name) === currentChoice,
+        )
+        if (!exists && geminiModelChoice !== GEMINI_CUSTOM_MODEL) {
+          setGeminiModelChoice(geminiModelDisplayName(usable[0].name))
+        }
+      }
+    } catch (e) {
+      if (isAbortError(e)) return
+      setGeminiModelsStatus((e as Error).message || '获取模型列表失败。')
+    } finally {
+      setGeminiModelsLoading(false)
+    }
+  }, [geminiApiKey, geminiModelChoice, geminiModelCustom])
+
+  // Best-effort auto refresh when key changes
+  useEffect(() => {
+    if (!geminiApiKey.trim()) return
+    void refreshGeminiModels()
+  }, [geminiApiKey, refreshGeminiModels])
 
   useEffect(() => {
     if (!rememberGeminiKey) {
@@ -782,6 +877,8 @@ function App() {
       recognitionRef.current = null
       geminiAbortRef.current?.abort()
       geminiAbortRef.current = null
+      geminiModelsAbortRef.current?.abort()
+      geminiModelsAbortRef.current = null
       rosterRecognitionRef.current?.abort()
       rosterRecognitionRef.current = null
       rosterAiAbortRef.current?.abort()
@@ -1047,7 +1144,14 @@ function App() {
         setGeminiMatchStatus(pairs.length ? `Gemini 已匹配并写入 ${pairs.length} 条记录。` : 'Gemini 未匹配到可确认的姓名-成绩（请检查花名册或转写文本）。')
       } catch (e) {
         if (isAbortError(e)) setGeminiMatchStatus('已取消 Gemini 匹配请求。')
-        else setGeminiMatchStatus((e as Error).message || 'Gemini 匹配失败。')
+        else {
+          const msg = (e as Error).message || 'Gemini 匹配失败。'
+          setGeminiMatchStatus(
+            msg.includes('models/') && msg.includes('not found')
+              ? `${msg}（请点击“刷新模型列表”，选择当前 Key 支持的模型）`
+              : msg,
+          )
+        }
         // Fallback to local parsing (no fuzzy mapping)
         setEntries((prev) => {
           const map = new Map<string, Entry>()
@@ -1139,7 +1243,12 @@ function App() {
       if (isAbortError(e)) {
         setGeminiStatus('已取消请求。')
       } else {
-        setGeminiStatus((e as Error).message || 'Gemini 请求失败。')
+        const msg = (e as Error).message || 'Gemini 请求失败。'
+        setGeminiStatus(
+          msg.includes('models/') && msg.includes('not found')
+            ? `${msg}（请点击“刷新模型列表”，选择当前 Key 支持的模型）`
+            : msg,
+        )
       }
     } finally {
       setGeminiLoading(false)
@@ -1344,27 +1453,44 @@ function App() {
               <div className="field-label">模型</div>
               <select
                 className="input select"
-                value={geminiModelPreset}
-                onChange={(e) => setGeminiModelPreset(e.target.value as GeminiModelPreset)}
+                value={geminiModelChoice}
+                onChange={(e) => setGeminiModelChoice(e.target.value)}
                 aria-label="Gemini 模型选择"
               >
-                <option value="gemini-1.5-flash">gemini-1.5-flash（推荐）</option>
-                <option value="gemini-1.5-pro">gemini-1.5-pro</option>
-                <option value="gemini-2.0-flash">gemini-2.0-flash</option>
-                <option value="gemini-2.0-flash-lite">gemini-2.0-flash-lite</option>
-                <option value="custom">自定义…</option>
+                {geminiModels.length ? (
+                  geminiModels.map((m) => (
+                    <option key={m.name} value={geminiModelDisplayName(m.name)}>
+                      {geminiModelDisplayName(m.name)}
+                      {m.displayName ? `（${m.displayName}）` : ''}
+                    </option>
+                  ))
+                ) : (
+                  <>
+                    <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+                    <option value="gemini-2.0-flash-lite">gemini-2.0-flash-lite</option>
+                    <option value="gemini-1.5-flash-latest">gemini-1.5-flash-latest</option>
+                  </>
+                )}
+                <option value={GEMINI_CUSTOM_MODEL}>自定义…</option>
               </select>
             </label>
           </div>
 
-          {geminiModelPreset === 'custom' ? (
+          <div className="ai-actions">
+            <button className="btn" onClick={() => void refreshGeminiModels()} disabled={geminiModelsLoading || !geminiApiKey.trim()}>
+              {geminiModelsLoading ? '刷新中…' : '刷新模型列表'}
+            </button>
+            {geminiModelsStatus ? <div className="tiny">{geminiModelsStatus}</div> : null}
+          </div>
+
+          {geminiModelChoice === GEMINI_CUSTOM_MODEL ? (
             <label className="field">
               <div className="field-label">自定义模型名称</div>
               <input
                 className="input"
                 value={geminiModelCustom}
                 onChange={(e) => setGeminiModelCustom(e.target.value)}
-                placeholder="例如：gemini-1.5-flash"
+                placeholder="例如：gemini-2.0-flash 或 models/gemini-2.0-flash"
               />
             </label>
           ) : null}
